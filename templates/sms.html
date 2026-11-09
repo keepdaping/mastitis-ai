@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}SMS log{% endblock %}
+{% block content %}
+<h1 class="h3">SMS log</h1>
+<p class="text-secondary">Every SMS attempt. Provider: <strong>{{ provider }}</strong>
+  {% if provider == "console" %}(messages are printed by the server, not really sent){% endif %}.
+  One SMS per alert episode, and at most one per cow every 12 hours.</p>
+
+<div class="d-flex flex-wrap gap-2 mb-3">
+  {% for status, cls in [("sent", "text-bg-success"), ("failed", "text-bg-danger"), ("rate_limited", "text-bg-secondary"), ("no_phone", "text-bg-warning")] %}
+    <span class="badge {{ cls }} fs-6">{{ status.replace("_", " ") }}: {{ counts.get(status, 0) }}</span>
+  {% endfor %}
+</div>
+
+<div class="table-responsive"><table class="table table-sm">
+  <thead><tr><th>Time</th><th>To</th><th>Cow</th><th>Status</th><th>Message</th><th class="d-none d-lg-table-cell">Provider response</th></tr></thead>
+  <tbody>
+  {% for m in log %}
+    <tr><td class="mono text-nowrap">{{ m.created_at|t }}</td><td class="mono text-nowrap">{{ m.to_phone or "-" }}</td>
+      <td>{% if m.cow %}<a href="/cows/{{ m.cow_id }}">{{ m.cow.tag }}</a>{% endif %}</td>
+      <td><span class="badge {{ {'sent': 'text-bg-success', 'failed': 'text-bg-danger', 'no_phone': 'text-bg-warning'}.get(m.status, 'text-bg-secondary') }}">{{ m.status.replace("_", " ") }}</span></td>
+      <td>{{ m.message }} <span class="small text-secondary">({{ m.message|length }} chars)</span></td>
+      <td class="small text-secondary d-none d-lg-table-cell">{{ m.provider }}: {{ (m.provider_response or "")[:120] }}</td></tr>
+  {% else %}<tr><td colspan="6" class="text-secondary">No SMS yet.</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}

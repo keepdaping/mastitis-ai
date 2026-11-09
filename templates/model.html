@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Model{% endblock %}
+{% block content %}
+<h1 class="h3">Model</h1>
+<div class="alert alert-warning"><strong>Simulated data.</strong> The model was trained and tested on simulated
+  farms. These numbers show the method works, not how it will perform on real Ugandan farms.
+  Real sensor and CMT data are needed to validate it.</div>
+
+{% if p %}
+<div class="row g-3 mb-3">
+  <div class="col-md-6"><div class="card h-100"><div class="card-body">
+    <h2 class="h5">Current model</h2>
+    <dl class="row mb-0">
+      <dt class="col-5">Version</dt><dd class="col-7 mono">{{ p.version }}</dd>
+      <dt class="col-5">Algorithm</dt><dd class="col-7">{{ p.bundle.model_name }}</dd>
+      <dt class="col-5">Trained</dt><dd class="col-7 mono">{{ p.bundle.trained_at }}</dd>
+      <dt class="col-5">Positive =</dt><dd class="col-7">{{ p.bundle.positive_definition }}</dd>
+      <dt class="col-5">Risk bands</dt><dd class="col-7 mono">low &lt; {{ floor }} &le; medium &lt; {{ "%.3f"|format(p.threshold) }} &le; high</dd>
+      <dt class="col-5">SMS alert</dt><dd class="col-7">2 high readings in a row, max 1 SMS per episode</dd>
+    </dl>
+  </div></div></div>
+  {% set t = metrics.get("test_metrics", {}) %}
+  <div class="col-md-6"><div class="card h-100"><div class="card-body">
+    <h2 class="h5">On held-out farms {{ metrics.get("test_farms", [])|join(", ") }}</h2>
+    {% if t %}
+    <div class="row text-center g-2">
+      {% for key, label in [("recall", "Sick cows caught"), ("precision", "Alerts that were right"),
+                            ("specificity", "Healthy cows not flagged"), ("roc_auc", "ROC-AUC")] %}
+      <div class="col-6"><div class="border rounded p-2"><div class="fs-3 fw-bold mono">{{ "%.0f"|format(t[key]*100) if key != "roc_auc" else "%.2f"|format(t[key]) }}{{ "%" if key != "roc_auc" }}</div>
+        <div class="small text-secondary">{{ label }} ({{ key }})</div></div></div>
+      {% endfor %}
+    </div>
+    <p class="small text-secondary mt-2 mb-0">Per CMT-labelled milking: {{ t.tp }} true alarms, {{ t.fn }} missed, {{ t.fp }} false alarms, {{ t.tn }} correct all-clears.</p>
+    {% else %}<p class="text-secondary">Run <code>python -m ml.evaluate</code> to create the metrics.</p>{% endif %}
+  </div></div></div>
+</div>
+
+{% if metrics.get("comparison") %}
+<div class="card mb-3">
+  <div class="card-header bg-white"><strong>All models compared on the held-out farms</strong></div>
+  <div class="table-responsive"><table class="table table-sm mb-0 mono">
+    <thead><tr><th>Model</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th><th>ROC-AUC</th><th>Specificity</th><th>Threshold</th></tr></thead>
+    <tbody>
+    {% for m in metrics.comparison %}
+      <tr class="{{ 'table-primary fw-semibold' if m.selected }}"><td>{{ m.model }}{% if m.selected %} (selected){% endif %}</td>
+        {% for k in ["accuracy", "precision", "recall", "f1", "roc_auc", "specificity", "threshold"] %}<td>{{ "%.3f"|format(m[k]) }}</td>{% endfor %}</tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% endif %}
+
+<div class="row g-3">
+  {% for file, title, alt in [("confusion_matrix.png", "Confusion matrix", "Confusion matrix of the selected model on the held-out farms"),
+                              ("shap_summary.png", "What drives the risk score (SHAP)", "SHAP summary plot: quarter conductivity difference and pH drive the score"),
+                              ("roc_curves.png", "ROC curves", "ROC curves of all candidate models")] %}
+    {% if has[file] %}
+    <div class="col-lg-6"><div class="card h-100"><div class="card-body">
+      <h2 class="h5">{{ title }}</h2>
+      <img src="/reports/{{ file }}" class="img-fluid" alt="{{ alt }}">
+    </div></div></div>
+    {% endif %}
+  {% endfor %}
+</div>
+{% else %}
+<div class="alert alert-danger">No trained model found. Run <code>python -m ml.train</code>.</div>
+{% endif %}
+{% endblock %}

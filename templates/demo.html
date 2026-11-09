@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Live demo{% endblock %}
+{% block content %}
+<h1 class="h3">Live demo</h1>
+<p class="text-secondary">Replays 3 cows from the held-out test farms through the prediction service, one milking every
+  2 seconds: <strong>one cow develops mastitis</strong>, two stay healthy. Watch the risk rise, the alert open after
+  2 high readings, and a single SMS go out (see <a href="/sms">SMS log</a> and <a href="/alerts">Alerts</a>).</p>
+
+<div class="d-flex flex-wrap gap-2 align-items-center mb-3">
+  <button id="start" class="btn btn-primary btn-lg" onclick="startDemo()">Start live demo</button>
+  <span id="status" class="text-secondary" role="status">Not running.</span>
+</div>
+<div class="progress mb-3" style="height: 8px" aria-hidden="true"><div id="bar" class="progress-bar" style="width: 0%"></div></div>
+<div id="error" class="alert alert-danger d-none"></div>
+
+<div class="row g-3">
+  <div class="col-lg-5">
+    <div class="card"><div class="card-header bg-white"><strong>Demo herd</strong> <span class="small text-secondary">refreshes every 2 s</span></div>
+      <div class="table-responsive"><table class="table mb-0">
+        <thead><tr><th>Cow</th><th>Risk</th><th>Alert</th></tr></thead>
+        <tbody id="herd"><tr><td colspan="3" class="text-secondary">Press "Start live demo".</td></tr></tbody>
+      </table></div></div>
+  </div>
+  <div class="col-lg-7">
+    <div class="card"><div class="card-header bg-white"><strong>Latest readings</strong></div>
+      <div class="table-responsive"><table class="table table-sm mb-0">
+        <thead><tr><th>Milking</th><th>Cow</th><th>Risk</th><th></th><th class="d-none d-md-table-cell">Truth</th><th>Main reason</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table></div></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let timer = null;
+
+async function startDemo() {
+  const res = await fetch("/api/demo/start?interval=2", {method: "POST"});
+  const data = await res.json();
+  if (!data.started) document.getElementById("status").textContent = "A demo is already running.";
+  poll();
+  if (!timer) timer = setInterval(poll, 2000);
+}
+
+async function poll() {
+  const [status, cows] = await Promise.all([
+    fetch("/api/demo/status").then(r => r.json()),
+    fetch("/api/cows?farm={{ farm }}").then(r => r.json())]);
+  const pct = status.total ? Math.round(100 * status.step / status.total) : 0;
+  document.getElementById("bar").style.width = pct + "%";
+  document.getElementById("start").disabled = status.running;
+  document.getElementById("status").textContent = status.running
+    ? `Running: milking ${status.step} of ${status.total}. Cow developing mastitis: ${status.sick_cow || "..."}`
+    : (status.step ? `Finished (${status.step} milkings). Press start to replay.` : "Not running.");
+  const err = document.getElementById("error");
+  err.classList.toggle("d-none", !status.error);
+  err.textContent = status.error || "";
+
+  document.getElementById("herd").innerHTML = cows.map(c => `<tr>
+      <td><a href="/cows/${c.id}">${escapeHtml(c.tag)}</a></td><td>${riskBadge(c.risk_level, c.risk_score)}</td>
+      <td>${c.active_alert_id ? '<span class="badge text-bg-danger">open alert</span>' : ""}</td></tr>`).join("")
+    || '<tr><td colspan="3" class="text-secondary">No demo cows yet.</td></tr>';
+
+  document.getElementById("log").innerHTML = status.log.map(l => `<tr>
+      <td class="mono">${escapeHtml(l.time)}</td><td>${escapeHtml(l.cow)}</td><td>${riskBadge(l.risk_level, l.risk_score)}</td>
+      <td>${l.alert ? '<span class="badge text-bg-danger">alert</span>' : ""}</td>
+      <td class="d-none d-md-table-cell">${escapeHtml(l.truth)}</td><td class="small">${escapeHtml(l.reason)}</td></tr>`).join("");
+
+  if (!status.running && timer && status.step) { clearInterval(timer); timer = null; }
+}
+poll();
+</script>
+{% endblock %}

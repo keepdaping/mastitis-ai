@@ -1,0 +1,20 @@
+{
+  "cow_id": "COW-012",
+  "farm_id": "FARM-01",
+  "timestamp": "2026-11-08T07:30:00",
+  "ec_ms_cm": 6.8,
+  "ec_quarters": {
+    "LF": 5.4,
+    "RF": 5.5,
+    "LR": 7.9,
+    "RR": 5.6
+  },
+  "milk_temp_c": 38.4,
+  "ph": 6.95,
+  "milk_yield_l": 6.2,
+  "cmt_score": null,
+  "breed": "exotic",
+  "parity": 3,
+  "days_in_milk": 120,
+  "grazing_system": "zero"
+}

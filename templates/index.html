@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% from "_macros.html" import risk_badge %}
+{% block title %}Herd overview{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+  <h1 class="h3 mb-0">Herd overview</h1>
+  <form method="get" class="d-flex gap-2 align-items-center">
+    <label for="farm" class="form-label mb-0 text-secondary">Farm</label>
+    <select id="farm" name="farm" class="form-select" onchange="this.form.submit()">
+      <option value="">All farms</option>
+      {% for f in farms %}
+        <option value="{{ f.id }}" {% if f.id == farm %}selected{% endif %}>{{ f.name }} ({{ f.id }})</option>
+      {% endfor %}
+    </select>
+    <noscript><button class="btn btn-outline-secondary">Show</button></noscript>
+  </form>
+</div>
+
+<div class="row g-3 mb-4">
+  {% set items = [("total_cows", "Cows"), ("high_today", "High risk today"),
+                  ("open_alerts", "Open alerts"), ("sms_week", "SMS sent this week")] %}
+  {% for key, label in items %}
+  <div class="col-6 col-lg-3">
+    <div class="card stat-card h-100"><div class="card-body">
+      <div class="value mono {% if key in ('high_today', 'open_alerts') and cards[key] %}text-danger{% endif %}">{{ cards[key] }}</div>
+      <div class="label">{{ label }}</div>
+    </div></div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="card">
+  <div class="card-header bg-white"><strong>Cows by latest risk</strong>
+    <span class="text-secondary small ms-2">highest first · tap a cow for details</span></div>
+  <div class="table-responsive">
+    <table class="table table-hover table-herd mb-0">
+      <thead><tr><th>Cow</th><th>Risk</th><th class="d-none d-md-table-cell">Farm</th>
+        <th class="d-none d-sm-table-cell">Latest milking</th><th class="d-none d-lg-table-cell">Breed</th>
+        <th class="d-none d-lg-table-cell">Parity</th><th class="d-none d-lg-table-cell">Days in milk</th><th>Alert</th></tr></thead>
+      <tbody>
+      {% for r in rows %}
+        <tr class="{% if r.risk_level == 'high' %}row-high{% endif %}">
+          <td><a href="/cows/{{ r.id }}" class="fw-semibold">{{ r.tag }}</a></td>
+          <td>{{ risk_badge(r.risk_level, r.risk_score) }}</td>
+          <td class="d-none d-md-table-cell">{{ r.farm }}</td>
+          <td class="d-none d-sm-table-cell mono">{{ r.latest_fmt }}</td>
+          <td class="d-none d-lg-table-cell">{{ r.breed }}</td>
+          <td class="d-none d-lg-table-cell mono">{{ r.parity }}</td>
+          <td class="d-none d-lg-table-cell mono">{{ r.days_in_milk if r.days_in_milk is not none else "-" }}</td>
+          <td>{% if r.active_alert_id %}<a href="/alerts" class="badge text-bg-danger text-decoration-none">open alert</a>{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="text-center text-secondary py-4">
+          No cows yet. Run <code>python scripts/seed_db.py</code> or start the <a href="/demo">live demo</a>.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

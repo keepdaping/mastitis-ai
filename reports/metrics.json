@@ -1,0 +1,93 @@
+{
+  "model_name": "RandomForest + SMOTE",
+  "version": "rf-smote-v1",
+  "threshold": 0.3858820237496709,
+  "test_farms": [
+    "F02",
+    "F09"
+  ],
+  "n_test": 1543,
+  "n_test_positive": 328,
+  "test_metrics": {
+    "accuracy": 0.9268,
+    "precision": 0.7929,
+    "recall": 0.8872,
+    "f1": 0.8374,
+    "roc_auc": 0.9463,
+    "specificity": 0.9374,
+    "threshold": 0.3859,
+    "tp": 291,
+    "fp": 76,
+    "tn": 1139,
+    "fn": 37
+  },
+  "comparison": [
+    {
+      "model": "LogReg + class_weight",
+      "accuracy": 0.7719,
+      "precision": 0.481,
+      "recall": 0.9268,
+      "f1": 0.6333,
+      "roc_auc": 0.9485,
+      "specificity": 0.73,
+      "threshold": 0.274,
+      "selected": ""
+    },
+    {
+      "model": "LogReg + SMOTE",
+      "accuracy": 0.7576,
+      "precision": 0.4647,
+      "recall": 0.9238,
+      "f1": 0.6184,
+      "roc_auc": 0.9481,
+      "specificity": 0.7128,
+      "threshold": 0.2678,
+      "selected": ""
+    },
+    {
+      "model": "RandomForest + class_weight",
+      "accuracy": 0.8555,
+      "precision": 0.6078,
+      "recall": 0.9024,
+      "f1": 0.7264,
+      "roc_auc": 0.9404,
+      "specificity": 0.8428,
+      "threshold": 0.2052,
+      "selected": ""
+    },
+    {
+      "model": "RandomForest + SMOTE",
+      "accuracy": 0.9268,
+      "precision": 0.7929,
+      "recall": 0.8872,
+      "f1": 0.8374,
+      "roc_auc": 0.9463,
+      "specificity": 0.9374,
+      "threshold": 0.3859,
+      "selected": "yes"
+    },
+    {
+      "model": "XGBoost + scale_pos_weight",
+      "accuracy": 0.7997,
+      "precision": 0.5168,
+      "recall": 0.8902,
+      "f1": 0.654,
+      "roc_auc": 0.9319,
+      "specificity": 0.7753,
+      "threshold": 0.1383,
+      "selected": ""
+    },
+    {
+      "model": "XGBoost + SMOTE",
+      "accuracy": 0.9209,
+      "precision": 0.7754,
+      "recall": 0.8841,
+      "f1": 0.8262,
+      "roc_auc": 0.9401,
+      "specificity": 0.9309,
+      "threshold": 0.1567,
+      "selected": ""
+    }
+  ],
+  "data": "SIMULATED"
+}

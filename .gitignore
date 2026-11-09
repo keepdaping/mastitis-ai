@@ -1,0 +1,12 @@
+# Secrets and local data
+.env
+data/app.db
+data/app.db-wal
+data/app.db-shm
+data/history.db
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/

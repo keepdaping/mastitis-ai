@@ -1,0 +1,25 @@
+/* Readable on a phone and on a projector: larger base text, strong contrast, big tap targets. */
+:root {
+  --risk-low: #0a7d0a;      /* good    - text label always shown with the colour */
+  --risk-medium: #fab219;   /* warning */
+  --risk-high: #d03b3b;     /* critical */
+  --q-lf: #2a78d6; --q-rf: #eb6834; --q-lr: #1baf7a; --q-rr: #c98500;   /* quarter series */
+}
+body { font-size: 1.05rem; background: #f9f9f7; color: #0b0b0b; }
+.card { border: 1px solid #e3e2dd; }
+.stat-card .value { font-size: 2.4rem; font-weight: 700; line-height: 1.1; }
+.stat-card .label { color: #52514e; font-size: .95rem; }
+.badge.risk { font-size: .9rem; padding: .4em .6em; min-width: 5.2em; }
+.risk-high { background: var(--risk-high); color: #fff; }
+.risk-medium { background: var(--risk-medium); color: #0b0b0b; }
+.risk-low { background: var(--risk-low); color: #fff; }
+.table td, .table th { vertical-align: middle; }
+.table-herd tr.row-high td:first-child { box-shadow: inset 4px 0 0 var(--risk-high); }
+.chart-box { position: relative; height: 260px; }
+.btn { min-height: 2.5rem; }
+.reason-list li { margin-bottom: .35rem; }
+.mono { font-variant-numeric: tabular-nums; }
+@media (max-width: 576px) {
+  .stat-card .value { font-size: 1.9rem; }
+  .chart-box { height: 220px; }
+}

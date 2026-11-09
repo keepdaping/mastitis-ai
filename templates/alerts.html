@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, episode %}
+{% block title %}Alerts{% endblock %}
+{% block content %}
+<h1 class="h3">Open alerts</h1>
+<p class="text-secondary">An alert is raised after <strong>2 high readings in a row</strong>. While the cow stays high,
+  new readings are added to the same alert (one SMS per episode). It closes automatically after 4 normal readings.</p>
+
+<div id="msg" class="alert d-none" role="status"></div>
+
+{% for a in active %}
+<div class="card mb-3" id="alert-{{ a.id }}">
+  <div class="card-body">
+    <div class="d-flex flex-wrap justify-content-between gap-2">
+      <div>
+        <a href="/cows/{{ a.cow_id }}" class="h5 mb-1 d-inline-block">Cow {{ a.cow_tag }}</a>
+        <span class="text-secondary">{{ a.farm or "" }}</span> {{ status_badge(a.status) }}
+        <div class="small">Episode: {{ episode(a) }} · latest risk
+          <strong>{{ "%.2f"|format(a.latest_risk) if a.latest_risk is not none else "-" }}</strong></div>
+        {% if a.note %}<div class="small text-secondary">Note: {{ a.note }}</div>{% endif %}
+      </div>
+    </div>
+    <div class="row g-2 mt-2 align-items-center">
+      <div class="col-12 col-md-5">
+        <input class="form-control" id="note-{{ a.id }}" placeholder="Optional note (e.g. CMT result, treatment)" maxlength="500">
+      </div>
+      <div class="col-12 col-md-7 d-flex flex-wrap gap-2">
+        <button class="btn btn-outline-warning text-dark" onclick="setStatus({{ a.id }}, 'checked')">Checked</button>
+        <button class="btn btn-success" onclick="setStatus({{ a.id }}, 'treated')">Treated</button>
+        <button class="btn btn-outline-secondary" onclick="setStatus({{ a.id }}, 'false_alarm')">False alarm</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="card mb-3"><div class="card-body text-secondary">No open alerts.</div></div>
+{% endfor %}
+
+<h2 class="h4 mt-4">Recently closed</h2>
+<p class="small text-secondary">False alarms are kept: they become negative examples when the model is retrained.</p>
+<div class="table-responsive"><table class="table table-sm">
+  <thead><tr><th>Cow</th><th>Status</th><th>Episode</th><th>Note</th></tr></thead>
+  <tbody>
+  {% for a in closed %}
+    <tr><td><a href="/cows/{{ a.cow_id }}">{{ a.cow_tag }}</a></td><td>{{ status_badge(a.status) }}</td>
+      <td class="small">{{ episode(a) }}</td><td class="small">{{ a.note or "" }}</td></tr>
+  {% else %}<tr><td colspan="4" class="text-secondary">None yet.</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function setStatus(id, status) {
+  const note = document.getElementById("note-" + id).value.trim();
+  const res = await fetch(`/api/alerts/${id}`, {
+    method: "PATCH", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({status, note: note || null})});
+  const msg = document.getElementById("msg");
+  if (res.ok) { location.reload(); return; }
+  msg.className = "alert alert-danger";
+  msg.textContent = "Could not update the alert: " + (await res.text());
+}
+</script>
+{% endblock %}

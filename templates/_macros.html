@@ -1,0 +1,18 @@
+{# Risk badge: colour + text, so it is never colour-only (colour-blind / projector friendly) #}
+{% macro risk_badge(level, score=None) -%}
+  {%- if level == "high" -%}<span class="badge risk risk-high">HIGH{% if score is not none %} {{ "%.2f"|format(score) }}{% endif %}</span>
+  {%- elif level == "medium" -%}<span class="badge risk risk-medium">MEDIUM{% if score is not none %} {{ "%.2f"|format(score) }}{% endif %}</span>
+  {%- elif level == "low" -%}<span class="badge risk risk-low">LOW{% if score is not none %} {{ "%.2f"|format(score) }}{% endif %}</span>
+  {%- else -%}<span class="badge text-bg-light border">no data</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro status_badge(status) -%}
+  {%- set cls = {"open": "text-bg-danger", "checked": "text-bg-warning", "treated": "text-bg-success",
+                 "false_alarm": "text-bg-secondary", "resolved_auto": "text-bg-info"} -%}
+  <span class="badge {{ cls.get(status, 'text-bg-light') }}">{{ status.replace("_", " ") }}</span>
+{%- endmacro %}
+
+{% macro episode(a) -%}
+  {{ a.first_reading[:16].replace("T", " ") }} &rarr; {{ a.latest_reading[:16].replace("T", " ") }}
+  <span class="text-secondary">({{ a.reading_count }} reading{{ "s" if a.reading_count != 1 }}, {{ a.episode_hours|round|int }} h)</span>
+{%- endmacro %}

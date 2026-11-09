@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% from "_macros.html" import risk_badge, status_badge, episode %}
+{% block title %}Cow {{ cow.tag }}{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap align-items-center gap-3 mb-3">
+  <h1 class="h3 mb-0">Cow {{ cow.tag }}</h1>
+  {% if latest %}{{ risk_badge(latest.risk_level, latest.risk_score) }}{% endif %}
+  <span class="text-secondary">{{ farm.name if farm else "No farm" }} · {{ cow.breed }} · parity {{ cow.parity }}
+    · {{ cow.grazing_system }} grazing{% if latest and latest.days_in_milk is not none %} · {{ latest.days_in_milk }} days in milk{% endif %}</span>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-5">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h5">Why this risk? <span class="text-secondary small fw-normal">latest milking {{ latest.timestamp|t if latest else "" }}</span></h2>
+      {% if latest and latest.top_reasons %}
+        <ul class="reason-list ps-3 mb-0">
+          {% for r in latest.top_reasons %}<li>{{ r.text }} <span class="text-secondary small mono">({{ r.effect }})</span></li>{% endfor %}
+        </ul>
+      {% else %}<p class="text-secondary mb-0">No readings yet.</p>{% endif %}
+    </div></div>
+  </div>
+  <div class="col-lg-7">
+    <div class="card h-100"><div class="card-body">
+      <h2 class="h5">Alert episodes</h2>
+      {% if episodes %}
+        <ul class="list-unstyled mb-0">
+        {% for a in episodes %}
+          <li class="mb-2">{{ status_badge(a.status) }} {{ episode(a) }}
+            {% if a.note %}<div class="small text-secondary">Note: {{ a.note }}</div>{% endif %}</li>
+        {% endfor %}
+        </ul>
+      {% else %}<p class="text-secondary mb-0">No alerts for this cow.</p>{% endif %}
+    </div></div>
+  </div>
+
+  <div class="col-12"><div class="card"><div class="card-body">
+    <h2 class="h5">Risk score over time</h2>
+    <p class="small text-secondary mb-2">Dashed line = alert threshold{% if threshold %} ({{ "%.2f"|format(threshold) }}){% endif %}. Last 30 days.</p>
+    <div class="chart-box"><canvas id="riskChart" aria-label="Risk score over time" role="img"></canvas></div>
+  </div></div></div>
+
+  <div class="col-12"><div class="card"><div class="card-body">
+    <h2 class="h5">Conductivity per quarter (mS/cm)</h2>
+    <p class="small text-secondary mb-2">An infected quarter rises above the other three.</p>
+    <div class="chart-box"><canvas id="ecChart" aria-label="Conductivity per quarter" role="img"></canvas></div>
+  </div></div></div>
+
+  <div class="col-md-6"><div class="card"><div class="card-body">
+    <h2 class="h5">Milk pH</h2>
+    <div class="chart-box"><canvas id="phChart" aria-label="Milk pH" role="img"></canvas></div>
+  </div></div></div>
+  <div class="col-md-6"><div class="card"><div class="card-body">
+    <h2 class="h5">Milk temperature (°C)</h2>
+    <div class="chart-box"><canvas id="tempChart" aria-label="Milk temperature" role="img"></canvas></div>
+  </div></div></div>
+
+  <div class="col-12"><div class="card">
+    <div class="card-header bg-white"><strong>Reading history</strong> <span class="small text-secondary">latest 60 milkings</span></div>
+    <div class="table-responsive"><table class="table table-sm mb-0 mono">
+      <thead><tr><th>Milking</th><th>Risk</th><th>Alert</th><th>LF</th><th>RF</th><th>LR</th><th>RR</th>
+        <th>pH</th><th>Temp</th><th>Yield (L)</th><th>CMT (1-5)</th></tr></thead>
+      <tbody>
+      {% for r in readings %}
+        <tr><td>{{ r.timestamp|t }}</td><td>{{ risk_badge(r.risk_level, r.risk_score) }}</td>
+          <td>{% if r.alert %}<span class="badge text-bg-danger">alert</span>{% endif %}</td>
+          {% for v in [r.ec_LF, r.ec_RF, r.ec_LR, r.ec_RR, r.ph, r.milk_temp_c, r.milk_yield_l] %}
+            <td>{{ "%.2f"|format(v) if v is not none else "–" }}</td>{% endfor %}
+          <td>{{ cmt_scale[r.cmt_score] if r.cmt_score is not none else "" }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const THRESHOLD = {{ threshold if threshold else "null" }};
+const css = getComputedStyle(document.documentElement);
+const Q = {LF: css.getPropertyValue("--q-lf"), RF: css.getPropertyValue("--q-rf"),
+           LR: css.getPropertyValue("--q-lr"), RR: css.getPropertyValue("--q-rr")};
+const NAMES = {LF: "Left front", RF: "Right front", LR: "Left rear", RR: "Right rear"};
+
+function line(id, labels, datasets, opts = {}) {
+  new Chart(document.getElementById(id), {
+    type: "line", data: {labels, datasets},
+    options: {scales: {x: {ticks: {maxTicksLimit: 8, autoSkip: true}}, y: opts.y || {}},
+              plugins: {legend: {display: datasets.length > 1, position: "bottom"}}, spanGaps: true}
+  });
+}
+
+fetch("/api/cows/{{ cow.id }}/readings?days=30").then(r => r.json()).then(rows => {
+  const labels = rows.map(r => r.label);
+  const risk = [{label: "Risk score", data: rows.map(r => r.risk_score), borderColor: "#2a78d6",
+                 pointRadius: rows.map(r => r.alert ? 4 : 0), pointBackgroundColor: "#d03b3b"}];
+  if (THRESHOLD) risk.push({label: "Alert threshold", data: rows.map(() => THRESHOLD),
+                            borderColor: "#898781", borderDash: [6, 4], borderWidth: 1.5});
+  line("riskChart", labels, risk, {y: {min: 0, max: 1}});
+  line("ecChart", labels, ["LF", "RF", "LR", "RR"].map(q => ({
+    label: `${q} (${NAMES[q]})`, data: rows.map(r => r["ec_" + q]), borderColor: Q[q], backgroundColor: Q[q]})));
+  line("phChart", labels, [{label: "pH", data: rows.map(r => r.ph), borderColor: "#2a78d6"}]);
+  line("tempChart", labels, [{label: "Temperature", data: rows.map(r => r.milk_temp_c), borderColor: "#eb6834"}]);
+});
+</script>
+{% endblock %}

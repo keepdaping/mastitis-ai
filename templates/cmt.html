@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Enter CMT result{% endblock %}
+{% block content %}
+<h1 class="h3">Enter a CMT result</h1>
+<p class="text-secondary">For a farmer or vet after a California Mastitis Test. The result is attached to the cow's
+  last recorded milking on that day and saved as a <strong>training label</strong> (3 or more = positive).</p>
+
+{% if message %}<div class="alert {{ 'alert-success' if ok else 'alert-danger' }}" role="status">{{ message }}</div>{% endif %}
+
+<div class="card mb-4" style="max-width: 560px"><div class="card-body">
+  <form method="post" action="/cmt">
+    <div class="mb-3">
+      <label for="cow_id" class="form-label">Cow</label>
+      <select class="form-select" id="cow_id" name="cow_id" required>
+        {% for c in cows %}<option value="{{ c.id }}">{{ c.tag }}{% if c.farm %} · {{ c.farm.name }}{% endif %}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="mb-3">
+      <label for="day" class="form-label">Date of the test</label>
+      <input type="date" class="form-control" id="day" name="day" value="{{ today }}" required>
+    </div>
+    <fieldset class="mb-3">
+      <legend class="form-label fs-6">CMT score (field scale 1-5)</legend>
+      {% for value, label in scale.items() %}
+        <div class="form-check">
+          <input class="form-check-input" type="radio" name="score" id="s{{ value }}" value="{{ value }}" {% if value == 0 %}checked{% endif %}>
+          <label class="form-check-label" for="s{{ value }}">{{ label }}</label>
+        </div>
+      {% endfor %}
+    </fieldset>
+    <button class="btn btn-primary btn-lg w-100">Save CMT result</button>
+  </form>
+</div></div>
+
+<h2 class="h5">Latest labels</h2>
+<div class="table-responsive"><table class="table table-sm">
+  <thead><tr><th>Cow</th><th>Milking</th><th>CMT</th><th>Model risk then</th></tr></thead>
+  <tbody>
+  {% for r in labels %}
+    <tr><td><a href="/cows/{{ r.cow_id }}">{{ r.cow.tag }}</a></td><td class="mono">{{ r.timestamp|t }}</td>
+      <td>{{ scale[r.cmt_score] }}</td><td class="mono">{{ "%.2f"|format(r.risk_score) if r.risk_score is not none else "-" }}</td></tr>
+  {% else %}<tr><td colspan="4" class="text-secondary">No CMT results yet.</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}
