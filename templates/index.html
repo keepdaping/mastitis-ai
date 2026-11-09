@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import risk_badge %}
+{% from "_macros.html" import risk_badge, alert_badge %}
 {% block title %}Herd overview{% endblock %}
 {% block content %}
 <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
@@ -31,7 +31,11 @@
 
 <div class="card">
   <div class="card-header bg-white"><strong>Cows by latest risk</strong>
-    <span class="text-secondary small ms-2">highest first · tap a cow for details</span></div>
+    <span class="text-secondary small ms-2">highest first · tap a cow for details</span>
+    <div class="legend-line mt-1">Alert = 2 high readings in a row · Recovering = alert still open, latest reading not high · Watch = first high reading
+      · Treated / false alarm = closed by the farmer, no new alert until a normal reading</div>
+    {% if bands %}<div class="legend-line">Risk: LOW below {{ "%.2f"|format(bands.medium) }} · MEDIUM {{ "%.2f"|format(bands.medium) }}–{{ "%.2f"|format(bands.high) }}
+      · HIGH from {{ "%.2f"|format(bands.high) }} (score = model output, not a probability)</div>{% endif %}</div>
   <div class="table-responsive">
     <table class="table table-hover table-herd mb-0">
       <thead><tr><th>Cow</th><th>Risk</th><th class="d-none d-md-table-cell">Farm</th>
@@ -40,14 +44,14 @@
       <tbody>
       {% for r in rows %}
         <tr class="{% if r.risk_level == 'high' %}row-high{% endif %}">
-          <td><a href="/cows/{{ r.id }}" class="fw-semibold">{{ r.tag }}</a></td>
+          <td class="text-nowrap"><a href="/cows/{{ r.id }}" class="fw-semibold">{{ r.tag }}</a></td>
           <td>{{ risk_badge(r.risk_level, r.risk_score) }}</td>
           <td class="d-none d-md-table-cell">{{ r.farm }}</td>
           <td class="d-none d-sm-table-cell mono">{{ r.latest_fmt }}</td>
           <td class="d-none d-lg-table-cell">{{ r.breed }}</td>
           <td class="d-none d-lg-table-cell mono">{{ r.parity }}</td>
           <td class="d-none d-lg-table-cell mono">{{ r.days_in_milk if r.days_in_milk is not none else "-" }}</td>
-          <td>{% if r.active_alert_id %}<a href="/alerts" class="badge text-bg-danger text-decoration-none">open alert</a>{% endif %}</td>
+          <td>{{ alert_badge(r.alert_state) }}</td>
         </tr>
       {% else %}
         <tr><td colspan="8" class="text-center text-secondary py-4">

@@ -59,7 +59,7 @@ async function poll() {
 
   document.getElementById("herd").innerHTML = cows.map(c => `<tr>
       <td><a href="/cows/${c.id}">${escapeHtml(c.tag)}</a></td><td>${riskBadge(c.risk_level, c.risk_score)}</td>
-      <td>${c.active_alert_id ? '<span class="badge text-bg-danger">open alert</span>' : ""}</td></tr>`).join("")
+      <td>${alertBadge(c.alert_state)}</td></tr>`).join("")
     || '<tr><td colspan="3" class="text-secondary">No demo cows yet.</td></tr>';
 
   document.getElementById("log").innerHTML = status.log.map(l => `<tr>

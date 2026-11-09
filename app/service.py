@@ -10,6 +10,10 @@ Used by POST /predict, scripts/seed_db.py and the /demo replay, so they behave i
        alert=true and no active episode  -> new alerts row + SMS
        alert=true and an active episode  -> attach the reading to it (no SMS)
        4 consecutive non-high readings   -> episode auto-resolves ("resolved_auto")
+       closed by the farmer (treated / false alarm) -> no new episode until the cow has had
+       at least one NON-high reading after the closure ("re-arm")
+  6. baseline flag: a high reading, or one taken while an episode is active, is stored with
+     baseline_exclude=True so it never becomes part of the cow's "normal" (ml/features.py)
 """
 from datetime import datetime, timedelta
 
@@ -22,12 +26,12 @@ from api.schemas import PredictRequest, PredictResponse
 from app.models import ACTIVE_ALERT_STATUSES, Alert, Cow, Farm, Reading
 from app.notify import notify_new_alert
 from app.predictor import get_predictor
+from ml.episodes import ALERT_MAX_GAP, AUTO_RESOLVE_AFTER   # same rules as training
 from ml.features import suspect_quarter
 
-HISTORY_DAYS = 8                       # enough for the 7-day baseline
-ALERT_MAX_GAP = timedelta(hours=48)    # 2 highs further apart than this are not "consecutive"
-AUTO_RESOLVE_AFTER = 4                 # consecutive non-high readings that close an episode
+HISTORY_DAYS = 22                      # baseline uses up to 21 days of clean readings
 QUARTERS = ["LF", "RF", "LR", "RR"]
+CLOSING_STATUSES = {"treated", "false_alarm"}
 
 
 class InputProblem(Exception):
@@ -73,6 +77,7 @@ def reading_to_row(r: Reading, cow: Cow) -> dict:
     return {"cow_id": cow.tag, "timestamp": r.timestamp, "breed": cow.breed, "parity": cow.parity,
             "days_in_milk": r.days_in_milk, "grazing_system": cow.grazing_system,
             "ec_ms_cm": r.ec_ms_cm, "ph": r.ph, "milk_temp_c": r.milk_temp_c, "milk_yield_l": r.milk_yield_l,
+            "baseline_exclude": bool(r.baseline_exclude),
             **{f"ec_{q.lower()}": getattr(r, f"ec_{q}") for q in QUARTERS}}
 
 
@@ -88,10 +93,48 @@ def active_alert(session: Session, cow_id: int) -> Alert | None:
     return session.execute(q.limit(1)).scalar_one_or_none()
 
 
+def latest_reading(session: Session, cow_id: int) -> Reading | None:
+    return session.execute(select(Reading).where(Reading.cow_id == cow_id)
+                           .order_by(Reading.timestamp.desc()).limit(1)).scalar_one_or_none()
+
+
+def close_alert(session: Session, alert: Alert, status: str, note: str | None = None,
+                when: datetime | None = None):
+    """Farmer closes an episode (treated / false_alarm) or acknowledges it (checked).
+    Used by the dashboard, USSD and the seed script."""
+    alert.status = status
+    if note:
+        alert.note = note
+    if status in CLOSING_STATUSES:
+        alert.closed_at = when or datetime.now().replace(microsecond=0)
+        last = latest_reading(session, alert.cow_id)
+        alert.closed_after_reading_id = last.id if last else None
+    else:
+        alert.closed_at = None
+
+
+def rearmed(session: Session, cow_id: int) -> bool:
+    """False while the cow's last farmer-closed episode has not been followed by a non-high
+    reading: the cow is still recovering from that episode, so it must not open a new one."""
+    closed = session.execute(
+        select(Alert).where(Alert.cow_id == cow_id, Alert.status.in_(CLOSING_STATUSES),
+                            Alert.closed_after_reading_id.is_not(None))
+        .order_by(Alert.id.desc()).limit(1)).scalar_one_or_none()
+    if closed is None:
+        return True
+    since = session.get(Reading, closed.closed_after_reading_id).timestamp
+    normal_after = session.execute(
+        select(Reading.id).where(Reading.cow_id == cow_id, Reading.timestamp > since,
+                                 Reading.risk_level != "high").limit(1)).first()
+    return normal_after is not None
+
+
 def update_episode(session: Session, cow: Cow, reading: Reading, quarter: str | None) -> Alert | None:
     """Create / extend / auto-resolve the cow's alert episode. Returns a NEW alert, if one was made."""
     current = active_alert(session, cow.id)
     if reading.alert:
+        if current is None and not rearmed(session, cow.id):
+            return None                                        # still high after treatment: no new SMS
         if current is None:                                    # new episode -> new row + SMS
             new = Alert(cow=cow, reading_id=reading.id, last_reading_id=reading.id, reading_count=1,
                         created_at=reading.timestamp, status="open")
@@ -136,10 +179,12 @@ def handle_reading(session: Session, req: PredictRequest) -> tuple[PredictRespon
     quarters = req.ec_quarters.model_dump() if req.ec_quarters else {}
     new = {"cow_id": cow.tag, "timestamp": ts, "breed": cow.breed, "parity": cow.parity,
            "days_in_milk": dim, "grazing_system": cow.grazing_system, "ec_ms_cm": req.ec_ms_cm,
+           "baseline_exclude": False,                         # its own flag never affects its features
            "ph": req.ph, "milk_temp_c": req.milk_temp_c, "milk_yield_l": req.milk_yield_l,
            **{f"ec_{q.lower()}": quarters.get(q) for q in QUARTERS}}
     frame = pd.DataFrame([reading_to_row(r, cow) for r in history] + [new])
-    num = [c for c in frame.columns if c not in ("cow_id", "timestamp", "breed", "grazing_system")]
+    num = [c for c in frame.columns if c not in ("cow_id", "timestamp", "breed", "grazing_system",
+                                                 "baseline_exclude")]
     frame[num] = frame[num].astype(float)                     # None -> NaN
     score, level, shap_row, feats = predictor.score(frame)
 
@@ -167,6 +212,10 @@ def handle_reading(session: Session, req: PredictRequest) -> tuple[PredictRespon
 
     # 5) Episodes + SMS
     update_episode(session, cow, reading, quarter.upper() if quarter else None)
+    session.flush()
+
+    # 6) Clean-baseline flag (same rule as training: ml/episodes.py)
+    reading.baseline_exclude = level == "high" or active_alert(session, cow.id) is not None
     session.commit()
 
     response = PredictResponse(

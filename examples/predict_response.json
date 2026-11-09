@@ -1,6 +1,6 @@
 {
   "cow_id": "COW-012",
-  "risk_score": 0.91,
+  "risk_score": 0.98,
   "risk_level": "high",
   "top_reasons": [
     {
@@ -10,16 +10,16 @@
     },
     {
       "feature": "ph",
-      "effect": "+0.12",
+      "effect": "+0.09",
       "text": "Milk pH higher than normal (6.95; normal is 6.6-6.8)"
     },
     {
-      "feature": "temp_vs_baseline",
-      "effect": "+0.03",
-      "text": "Milk warmer than usual (38.4 C)"
+      "feature": "ec_vs_baseline",
+      "effect": "+0.05",
+      "text": "Conductivity 14% above the herd average"
     }
   ],
   "advice": "Likely mastitis in the left rear quarter. Do a CMT test on this cow today and call your vet. Milk her last, and do not sell milk from a treated cow until the withdrawal period ends.",
-  "model_version": "rf-smote-v1",
+  "model_version": "rf-smote-v2",
   "alert": false
 }

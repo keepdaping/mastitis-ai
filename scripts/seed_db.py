@@ -6,6 +6,12 @@ milkings through the SAME code as POST /predict (app.service.handle_reading), so
 reading, risk score, alert episode and SMS-log entry is produced exactly as in live use.
 Timestamps are shifted so the history ends today.
 
+Farmer behaviour is simulated too: every alert episode that starts more than 3 days before
+today gets a fate, decided when it opens and applied 12-36 h later:
+  ~60% treated (by the vet), ~15% marked false alarm, the rest left open.
+A treated cow responds to treatment: 5-10 days after the treatment her remaining infected
+readings are replaced by healthy readings (her own healthy levels + sensor noise).
+
     python scripts/seed_db.py            # first run (refuses if the database already has data)
     python scripts/seed_db.py --reset    # wipe data/app.db and seed again
 
@@ -22,9 +28,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 CSV = ROOT / "data" / "synthetic_milkings.csv"
+QUARTERS = ["lf", "rf", "lr", "rr"]
+P_TREATED, P_FALSE_ALARM = 0.60, 0.15     # the rest of the older episodes stay open
+FATE_MIN_AGE = timedelta(days=3)          # episodes younger than this are left open
+FARMER_DELAY_H = (12, 36)                 # hours from alert to the farmer's action
+RECOVERY_DAYS = (5, 10)                   # days from treatment to healthy readings
+NOTES = {"treated": "Treated by vet, intramammary antibiotic",
+         "false_alarm": "Farmer: CMT negative at check, no treatment"}
 
 # Farm details are fictional (SIMULATED). Phone numbers are Africa's Talking sandbox-style numbers.
 FARMS = {
@@ -44,12 +58,44 @@ def choose_cows(df: pd.DataFrame, farm: str, n: int, window_days: list[int], see
     return sorted(sick + healthy)
 
 
+def healthy_levels(df: pd.DataFrame) -> pd.DataFrame:
+    """Each cow's typical HEALTHY readings (median over milkings without any infected quarter)."""
+    healthy = df[df["true_infected_quarters"].isna()]
+    cols = [f"ec_{q}" for q in QUARTERS] + ["ph", "milk_temp_c"]
+    return healthy.groupby("cow_id")[cols].median()
+
+
+def recover_after_treatment(rows: pd.DataFrame, start_pos: int, cow: str, recovery_time: pd.Timestamp,
+                            levels: pd.DataFrame, rng: np.random.Generator) -> int:
+    """Simulate a cure: from `recovery_time` until this infection would have ended anyway, replace the
+    cow's readings with healthy ones (her own healthy level + sensor noise). Returns rows changed."""
+    later = rows.iloc[start_pos:]
+    later = later[later["cow_id"] == cow]
+    infected = later["true_infected_quarters"].notna()
+    # The current infection = the run of infected readings from now; it ends at the first healthy one
+    run = later.loc[:infected.idxmin()] if not infected.all() else later
+    target = run.index[(run["timestamp"] >= recovery_time) & run["true_infected_quarters"].notna()]
+    noise = {"ph": 0.03, "milk_temp_c": 0.10}
+    for idx in target:
+        for col in levels.columns:
+            if pd.notna(rows.at[idx, col]):                  # keep missing sensor values missing
+                sd = 0.20 if col.startswith("ec_") else noise[col]
+                rows.at[idx, col] = round(float(levels.at[cow, col] + rng.normal(0, sd)), 2)
+        if pd.notna(rows.at[idx, "cmt_score"]):              # a cured cow tests (mostly) negative
+            rows.at[idx, "cmt_score"] = int(rng.choice([0, 1, 2], p=[0.85, 0.13, 0.02]))
+        rows.at[idx, "true_infected"] = 0
+        rows.at[idx, "true_infected_quarters"] = np.nan
+    return len(target)
+
+
 def seed(farms: dict = FARMS, cows_per_farm: int = 10, days: int = 30, quiet: bool = False) -> dict:
     """Add farms, cows and replayed readings to the database. Returns counts."""
     from api.schemas import PredictRequest
     from app.db import SessionLocal, init_db
+    from sqlalchemy import func, select
+
     from app.models import Alert, Farm, Reading, SmsLog
-    from app.service import handle_reading
+    from app.service import close_alert, handle_reading
     from simulator.send_readings import to_payload
 
     init_db()
@@ -67,18 +113,50 @@ def seed(farms: dict = FARMS, cows_per_farm: int = 10, days: int = 30, quiet: bo
     # Shift whole days so the last simulated day is today; drop milkings that would be in the future
     shift = pd.Timestamp(datetime.now().date()) - rows["timestamp"].max().normalize()
     rows["timestamp"] += shift
-    rows = rows[rows["timestamp"] <= pd.Timestamp(datetime.now())]
+    rows = rows[rows["timestamp"] <= pd.Timestamp(datetime.now())].reset_index(drop=True)
+    rows["true_infected_quarters"] = rows["true_infected_quarters"].astype(object)
 
+    rng = np.random.default_rng(7)
+    levels = healthy_levels(df)
+    fate_before = (rows["timestamp"].max() - FATE_MIN_AGE).to_pydatetime()
+    pending = []                      # farmer actions: (time, alert_id, status)
+    fates = {"treated": 0, "false_alarm": 0, "left_open": 0}
+    made_healthy = 0
     start = time.time()
-    for i, (_, r) in enumerate(rows.iterrows(), start=1):
+    for pos in range(len(rows)):
+        r = rows.iloc[pos]                                   # re-read: a treatment may have changed it
         with SessionLocal() as s:
-            handle_reading(s, PredictRequest(**to_payload(r)))
-        if not quiet and (i % 200 == 0 or i == len(rows)):
-            print(f"  {i}/{len(rows)} readings ({time.time() - start:.0f} s)", flush=True)
+            # 1) farmer actions that are due before this milking
+            for action in sorted(a for a in pending if a[0] <= r["timestamp"]):
+                pending.remove(action)
+                alert = s.get(Alert, action[1])
+                if alert is not None and alert.is_active:    # it may have auto-resolved meanwhile
+                    close_alert(s, alert, action[2], NOTES[action[2]], when=action[0].to_pydatetime())
+                    s.commit()
+            # 2) the milking itself, through the same code as POST /predict
+            _, reading = handle_reading(s, PredictRequest(**to_payload(r)))
+            # 3) a new episode? decide now what the farmer will do about it
+            new = s.execute(select(Alert).where(Alert.reading_id == reading.id)).scalar_one_or_none()
+            if new is not None and new.created_at < fate_before:
+                u = rng.random()
+                if u < P_TREATED + P_FALSE_ALARM:
+                    status = "treated" if u < P_TREATED else "false_alarm"
+                    when = r["timestamp"] + pd.Timedelta(hours=float(rng.uniform(*FARMER_DELAY_H)))
+                    pending.append((when, new.id, status))
+                    fates[status] += 1
+                    if status == "treated":
+                        recovery = when + pd.Timedelta(days=float(rng.uniform(*RECOVERY_DAYS)))
+                        made_healthy += recover_after_treatment(rows, pos + 1, r["cow_id"], recovery, levels, rng)
+                else:
+                    fates["left_open"] += 1
+        if not quiet and ((pos + 1) % 200 == 0 or pos + 1 == len(rows)):
+            print(f"  {pos + 1}/{len(rows)} readings ({time.time() - start:.0f} s)", flush=True)
 
     with SessionLocal() as s:
         counts = {"farms": len(farms), "cows": len(tags), "readings": s.query(Reading).count(),
-                  "alerts": s.query(Alert).count(), "sms_sent": s.query(SmsLog).filter_by(status="sent").count()}
+                  "alerts": s.query(Alert).count(), "sms_sent": s.query(SmsLog).filter_by(status="sent").count(),
+                  "fates_drawn": fates, "readings_made_healthy": made_healthy,
+                  "alert_status": dict(s.query(Alert.status, func.count(Alert.id)).group_by(Alert.status).all())}
     return counts
 
 

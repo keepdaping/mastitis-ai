@@ -13,6 +13,13 @@ body { font-size: 1.05rem; background: #f9f9f7; color: #0b0b0b; }
 .risk-high { background: var(--risk-high); color: #fff; }
 .risk-medium { background: var(--risk-medium); color: #0b0b0b; }
 .risk-low { background: var(--risk-low); color: #fff; }
+.risk-score { font-size: .85rem; color: #6c6b66; font-variant-numeric: tabular-nums; }
+/* Alert column */
+.badge.alert-open { background: var(--risk-high); color: #fff; }
+.badge.alert-recovering { background: #5b7083; color: #fff; }       /* grey-blue: still open, improving */
+.badge.alert-watch { background: var(--risk-medium); color: #0b0b0b; }
+.badge.alert-closed { background: #fff; color: #3d4f5f; border: 1px solid #5b7083; }  /* closed by farmer */
+.legend-line { font-size: .85rem; color: #52514e; }
 .table td, .table th { vertical-align: middle; }
 .table-herd tr.row-high td:first-child { box-shadow: inset 4px 0 0 var(--risk-high); }
 .chart-box { position: relative; height: 260px; }

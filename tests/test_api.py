@@ -40,6 +40,7 @@ def test_health(client):
 def test_model_info(client):
     info = client.get("/model-info").json()
     assert info["version"] and 0 < info["threshold"] < 1
+    assert info["risk_bands"]["low"] == "< 0.25" and info["risk_bands"]["medium"].startswith("0.25 - ")
     assert "alert" in info["alert_rule"]
 
 
@@ -123,9 +124,10 @@ def test_high_ec_quarter_gives_higher_risk(client, healthy_reading, spike_readin
 
 def test_risk_bands():
     from api.main import risk_level
-    assert [risk_level(s, 0.6) for s in (0.1, 0.4, 0.59, 0.6, 0.9)] == ["low", "medium", "medium", "high", "high"]
-    # threshold below 0.4 -> medium band starts at threshold / 2 so it never disappears
-    assert [risk_level(s, 0.3) for s in (0.1, 0.15, 0.29, 0.3)] == ["low", "medium", "medium", "high"]
+    assert [risk_level(s, 0.6) for s in (0.1, 0.24, 0.25, 0.59, 0.6, 0.9)] == \
+        ["low", "low", "medium", "medium", "high", "high"]
+    # threshold at or below 0.25 -> medium band starts at threshold / 2 so it never disappears
+    assert [risk_level(s, 0.2) for s in (0.05, 0.1, 0.19, 0.2)] == ["low", "medium", "medium", "high"]
 
 
 # ---------------------------------------------------------------- alert logic

@@ -13,7 +13,7 @@ output for the request example).
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/predict` | Risk for one milking. Also stores the reading in the cow's history. |
-| `GET` | `/health` | `{"status": "ok", "model_loaded": true, "model_version": "rf-smote-v1"}` |
+| `GET` | `/health` | `{"status": "ok", "model_loaded": true, "model_version": "rf-smote-v2"}` |
 | `GET` | `/model-info` | Model name, version, threshold, risk bands, alert rule, test metrics |
 | `GET` | `/history/{cow_id}?limit=50` | Stored readings for a cow, newest first (includes `cmt_score`, `risk_score`, `risk_level`, `alert`, `top_reasons`) |
 
@@ -70,15 +70,15 @@ of missing sensor data. It falls back the same way as training (`ml/features.py`
 ```json
 {
   "cow_id": "COW-012",
-  "risk_score": 0.91,
+  "risk_score": 0.98,
   "risk_level": "high",
   "top_reasons": [
     {"feature": "ec_quarter_diff", "effect": "+0.30", "text": "Left rear quarter conductivity much higher than others (+2.4 mS/cm)"},
-    {"feature": "ph", "effect": "+0.12", "text": "Milk pH higher than normal (6.95; normal is 6.6-6.8)"},
-    {"feature": "temp_vs_baseline", "effect": "+0.03", "text": "Milk warmer than usual (38.4 C)"}
+    {"feature": "ph", "effect": "+0.09", "text": "Milk pH higher than normal (6.95; normal is 6.6-6.8)"},
+    {"feature": "ec_vs_baseline", "effect": "+0.05", "text": "Conductivity 14% above the herd average"}
   ],
   "advice": "Likely mastitis in the left rear quarter. Do a CMT test on this cow today and call your vet. Milk her last, and do not sell milk from a treated cow until the withdrawal period ends.",
-  "model_version": "rf-smote-v1",
+  "model_version": "rf-smote-v2",
   "alert": false
 }
 ```
@@ -88,12 +88,12 @@ of missing sensor data. It falls back the same way as training (`ml/features.py`
 | `cow_id` | string | Echo of the request. |
 | `risk_score` | number 0-1, 2 decimals | Model score; higher = more likely subclinical mastitis. It ranks cows; it is **not** a calibrated probability. |
 | `risk_level` | `low` \| `medium` \| `high` | Band for **this reading** (see risk bands below). |
-| `top_reasons` | array of 1-3 | Main reasons, most important first. |
+| `top_reasons` | array of 1-3 | Main reasons, most important first. Reasons with \|effect\| < 0.03 are left out (too small to matter), but there is always at least one. |
 | `top_reasons[].feature` | string | The model feature behind the reason, e.g. `ec_quarter_diff`, `ec_vs_baseline`, `ph`. |
 | `top_reasons[].effect` | string | Signed contribution to the score (SHAP), always 2 decimals: `"+0.21"`, `"-0.05"`. Closely related features (e.g. the three quarter-EC features) are combined into one reason. |
 | `top_reasons[].text` | string | Plain-English sentence for the farmer. Quarters are named in words ("Left rear quarter ..."). |
 | `advice` | string | What the farmer should do, by risk level (below). |
-| `model_version` | string | From the saved model metadata, e.g. `rf-smote-v1` (model + imbalance method + version). |
+| `model_version` | string | From the saved model metadata, e.g. `rf-smote-v2` (model + imbalance method + version). |
 | `alert` | boolean | `true` only when this reading **and** the cow's previous reading are both `high`. **Only `alert: true` should trigger an SMS.** |
 
 **Reason direction.** For `medium`/`high` the reasons are the factors that *raise* risk. For `low` they are
@@ -102,10 +102,12 @@ lactation stage are only ever shown as factors that *raise* risk.
 
 ### Risk bands
 
-`low < 0.4 <= medium < threshold <= high`, where `threshold` is tuned at training time for recall >= 0.85.
+`low < 0.25 <= medium < threshold <= high`, where `threshold` is tuned at training time for recall >= 0.85.
 
-The current model's threshold is **0.386**, which is below 0.4. To keep a medium band, the API then
-starts medium at half the threshold, so today: **low < 0.193 <= medium < 0.386 <= high**.
+The current model (`rf-smote-v2`) has threshold **0.416**, so today: **low < 0.25 <= medium < 0.416 <= high**.
+Medium means "worth watching": the score is raised but below the alert threshold.
+(If a retrained model's threshold were ever <= 0.25, the medium band would be empty; the API would then
+start medium at half the threshold instead.)
 `GET /model-info` → `risk_bands` always returns the bands actually in use. Read them from there instead
 of hard-coding numbers in the dashboard.
 
@@ -156,6 +158,9 @@ outside 0-700), a missing required field, or wrong types.
 model in `models/`.
 
 ## Changelog
+
+- **v1.2.1:** the medium band now starts at 0.25 (was 0.4): `low < 0.25 <= medium < threshold <= high`.
+  Request and response fields are unchanged.
 
 - **v1.2** (backward compatible, request and response otherwise unchanged): `days_in_milk` may be omitted for a
   cow whose calving date is on record. Every reading is now stored in the database (`data/app.db`). An

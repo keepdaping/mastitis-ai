@@ -1,9 +1,21 @@
 // Small helpers shared by the dashboard pages (no build step, plain JS).
 
+// Same output as the risk_badge / alert_badge macros in templates/_macros.html.
 function riskBadge(level, score) {
   if (!level) return '<span class="badge text-bg-light border">no data</span>';
-  const s = score == null ? "" : " " + Number(score).toFixed(2);
-  return `<span class="badge risk risk-${level}">${level.toUpperCase()}${s}</span>`;
+  // Score capped at 0.99: it is a model output, not a probability
+  const s = score == null ? "" : ` <span class="risk-score">${Math.min(Number(score), 0.99).toFixed(2)}</span>`;
+  return `<span class="text-nowrap" title="Risk score (model output, not a probability)">` +
+         `<span class="badge risk risk-${level}">${level.toUpperCase()}</span>${s}</span>`;
+}
+
+function alertBadge(state) {
+  if (state === "open_alert") return '<a href="/alerts" class="badge alert-open text-decoration-none">open alert</a>';
+  if (state === "recovering") return '<a href="/alerts" class="badge alert-recovering text-decoration-none">recovering</a>';
+  if (state === "treated") return '<span class="badge alert-closed">treated</span>';
+  if (state === "false_alarm") return '<span class="badge alert-closed">false alarm</span>';
+  if (state === "watch") return '<span class="badge alert-watch">watch – 1 high reading</span>';
+  return "";
 }
 
 function escapeHtml(text) {

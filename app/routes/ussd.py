@@ -10,7 +10,7 @@ The farm is identified by the caller's phone number (farms.phone).
   2  Enter CMT result   -> cow tag -> score 1-5
   3  Mark alert as treated -> pick the alert
 """
-from datetime import date, datetime
+from datetime import date
 
 from fastapi import APIRouter, Form
 from fastapi.responses import PlainTextResponse
@@ -19,6 +19,7 @@ from sqlalchemy import select
 from app.db import SessionLocal
 from app.models import ACTIVE_ALERT_STATUSES, Alert, Cow, Farm
 from app.routes.dashboard import herd_rows, save_cmt
+from app.service import close_alert
 
 router = APIRouter()
 MAX_ITEMS = 5          # USSD screens are small (~180 characters)
@@ -95,9 +96,7 @@ def ussd(sessionId: str = Form(""), serviceCode: str = Form(""), phoneNumber: st
             if not steps[1].isdigit() or not 1 <= int(steps[1]) <= len(alerts):
                 return end("Invalid choice.")
             alert = alerts[int(steps[1]) - 1]
-            alert.status = "treated"
-            alert.note = (alert.note + "; " if alert.note else "") + "marked treated via USSD"
-            alert.closed_at = datetime.now().replace(microsecond=0)
+            close_alert(s, alert, "treated", (alert.note + "; " if alert.note else "") + "marked treated via USSD")
             s.commit()
             return end(f"Alert for {alert.cow.tag} marked as treated.")
 

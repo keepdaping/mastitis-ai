@@ -4,7 +4,10 @@ Train and compare models for subclinical mastitis (SCM) detection.
 Steps:
   1. Load the (SIMULATED) milkings, hold out 2 whole farms as the test set.
      Splitting by farm checks the model works on farms it has never seen.
-  2. Build features with ml/features.py (herd medians from TRAIN farms only).
+  2. Build features with ml/features.py (herd medians from TRAIN farms only), with a CLEAN
+     baseline: readings that were high risk or inside an alert episode don't count towards a
+     cow's "normal". Those flags need risk levels, so they come from a stage-0 model
+     (see baseline_flags()), exactly as the live service stores them per reading.
   3. Keep only milkings with a CMT label; positive = cmt_score >= 2.
   4. Compare 3 models x 2 ways of handling class imbalance
      (class weights vs SMOTE oversampling) with 5-fold GroupKFold CV by farm.
@@ -32,6 +35,7 @@ from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+from ml.episodes import flags_for_frame
 from ml.features import FEATURES, build_features, compute_reference
 
 SEED = 42
@@ -43,7 +47,7 @@ CV_FOLDS = 5
 MIN_PRECISION = 0.5        # selection constraint
 TARGET_RECALL = 0.85       # threshold tuning target
 POSITIVE_CMT = 2           # cmt_score 0-4; >= 2 means CMT >= 3 on the 1-5 field scale
-MODEL_VERSION = 1          # bump when retraining on new data -> model_version e.g. "rf-smote-v2"
+MODEL_VERSION = 2          # bump when retraining -> model_version e.g. "rf-smote-v2" (v2: clean baseline)
 SLUGS = {                  # short names used in model_version (returned by the API)
     "LogReg + class_weight": "lr-cw", "LogReg + SMOTE": "lr-smote",
     "RandomForest + class_weight": "rf-cw", "RandomForest + SMOTE": "rf-smote",
@@ -51,7 +55,39 @@ SLUGS = {                  # short names used in model_version (returned by the 
 }
 
 
-def load_and_split():
+def baseline_flags(df, X0, y, labelled, is_test):
+    """Stage 0: which readings must be excluded from each cow's baseline.
+
+    In the live service a reading is excluded if the model rated it high, or an alert episode
+    was active (ml/episodes.py). To create the same flags for the training data we need a risk
+    level for EVERY reading, so we score all readings with a simple stage-0 model, always
+    OUT-OF-FARM (a farm is never scored by a model trained on its own labels):
+      - training farms: 5-fold GroupKFold over farms
+      - test farms:     model trained on all training farms
+    The stage-0 features use the plain (unfiltered) baseline, so nothing is circular, and every
+    flag uses only the current and earlier readings (no future leakage).
+    """
+    rf0 = RandomForestClassifier(n_estimators=200, min_samples_leaf=5, class_weight="balanced",
+                                 n_jobs=-1, random_state=SEED)
+    score = pd.Series(np.nan, index=df.index)
+    train_rows = df.index[~is_test]
+    farms = df.loc[train_rows, "farm_id"]
+    for fit_idx, score_idx in GroupKFold(n_splits=CV_FOLDS).split(train_rows, groups=farms):
+        fit_farms, score_farms = set(farms.iloc[fit_idx]), set(farms.iloc[score_idx])
+        fit = labelled & df["farm_id"].isin(fit_farms)
+        m = clone(rf0).fit(X0[fit], y[fit])
+        rows = df["farm_id"].isin(score_farms)
+        score[rows] = m.predict_proba(X0[rows])[:, 1]
+    m = clone(rf0).fit(X0[labelled & ~is_test], y[labelled & ~is_test])
+    score[is_test] = m.predict_proba(X0[is_test])[:, 1]
+
+    lab_train = labelled & ~is_test
+    thr0, _, _ = tune_threshold(y[lab_train], score[lab_train])     # same rule as the final model
+    flags = flags_for_frame(df, score >= thr0)
+    return flags, {"stage0_threshold": round(thr0, 4), "share_excluded": round(float(flags.mean()), 4)}
+
+
+def load_and_split(verbose: bool = False):
     """Load data, split farms into train/test, build features. Returns labelled rows only."""
     df = pd.read_csv(DATA, parse_dates=["timestamp"])
     gss = GroupShuffleSplit(n_splits=1, test_size=N_TEST_FARMS, random_state=SEED)
@@ -61,15 +97,25 @@ def load_and_split():
 
     is_test = df["farm_id"].isin(test_farms)
     reference = compute_reference(df[~is_test])        # no information from test farms
-    X_all = build_features(df, reference)               # uses ALL milkings for baselines
-
     labelled = df["cmt_score"].notna()
     y_all = (df["cmt_score"] >= POSITIVE_CMT).astype(int)
+
+    # Stage 0 -> baseline exclusion flags -> final features with a CLEAN baseline
+    X0 = build_features(df, reference)
+    flags, info = baseline_flags(df, X0, y_all, labelled, is_test)
+    X_all = build_features(df.assign(baseline_exclude=flags), reference)
+    if verbose:
+        infected = df["true_infected"] == 1
+        print(f"Clean baseline: {info['share_excluded']:.1%} of readings excluded "
+              f"(stage-0 threshold {info['stage0_threshold']:.3f}); "
+              f"{flags[infected].mean():.1%} of truly infected readings and "
+              f"{flags[~infected].mean():.1%} of healthy readings excluded")
+
     tr, te = labelled & ~is_test, labelled & is_test
     return {
         "X_train": X_all[tr], "y_train": y_all[tr], "g_train": df.loc[tr, "farm_id"],
         "X_test": X_all[te], "y_test": y_all[te], "meta_test": df.loc[te],
-        "test_farms": test_farms, "reference": reference,
+        "test_farms": test_farms, "reference": reference, "baseline_info": info,
     }
 
 
@@ -121,7 +167,7 @@ def tune_threshold(y, proba, target_recall=TARGET_RECALL):
 def main():
     MODELS.mkdir(exist_ok=True)
     REPORTS.mkdir(exist_ok=True)
-    d = load_and_split()
+    d = load_and_split(verbose=True)
     X, y, g = d["X_train"], d["y_train"], d["g_train"]
 
     # --- Class balance (check BEFORE choosing an imbalance strategy) ---
@@ -175,6 +221,8 @@ def main():
         "threshold": fitted[best_name]["threshold"],
         "features": FEATURES,
         "reference": d["reference"],         # herd medians for cows without history
+        "baseline": {"rule": "clean readings only: 7 d if >= 3, else 21 d if >= 3, else herd median",
+                     **d["baseline_info"]},
         "background": X.sample(200, random_state=SEED),   # SHAP background sample (API explanations)
         "test_farms": d["test_farms"],
         "version": version,

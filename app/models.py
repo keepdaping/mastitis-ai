@@ -71,6 +71,9 @@ class Reading(Base):
     risk_score: Mapped[float | None] = mapped_column(Float)
     risk_level: Mapped[str | None] = mapped_column(String(8))
     alert: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True = not part of the cow's "normal" (high risk, or during an active alert episode).
+    # Used by ml/features.py for the clean baseline, exactly as in training.
+    baseline_exclude: Mapped[bool] = mapped_column(Boolean, default=False)
     top_reasons: Mapped[list | None] = mapped_column(JSON)
     model_version: Mapped[str | None] = mapped_column(String(40))
 
@@ -89,6 +92,10 @@ class Alert(Base):
     status: Mapped[str] = mapped_column(String(16), default="open", index=True)
     note: Mapped[str | None] = mapped_column(Text)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # The cow's latest reading when a farmer closed the alert (treated / false alarm). A new
+    # episode can only start after a NON-high reading that comes after this one ("re-arm"),
+    # so a cow that is still high while antibiotics work doesn't trigger a new alert + SMS.
+    closed_after_reading_id: Mapped[int | None] = mapped_column(ForeignKey("readings.id"))
 
     cow: Mapped[Cow] = relationship()
     first_reading: Mapped[Reading] = relationship(foreign_keys=[reading_id])

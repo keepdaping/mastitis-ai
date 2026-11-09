@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% from "_macros.html" import risk_badge, status_badge, episode %}
+{% from "_macros.html" import risk_badge, alert_badge, status_badge, episode %}
 {% block title %}Cow {{ cow.tag }}{% endblock %}
 {% block content %}
 <div class="d-flex flex-wrap align-items-center gap-3 mb-3">
   <h1 class="h3 mb-0">Cow {{ cow.tag }}</h1>
-  {% if latest %}{{ risk_badge(latest.risk_level, latest.risk_score) }}{% endif %}
+  {% if latest %}{{ risk_badge(latest.risk_level, latest.risk_score) }} {{ alert_badge(alert_state) }}{% endif %}
   <span class="text-secondary">{{ farm.name if farm else "No farm" }} · {{ cow.breed }} · parity {{ cow.parity }}
     · {{ cow.grazing_system }} grazing{% if latest and latest.days_in_milk is not none %} · {{ latest.days_in_milk }} days in milk{% endif %}</span>
 </div>
@@ -82,25 +82,33 @@ const Q = {LF: css.getPropertyValue("--q-lf"), RF: css.getPropertyValue("--q-rf"
            LR: css.getPropertyValue("--q-lr"), RR: css.getPropertyValue("--q-rr")};
 const NAMES = {LF: "Left front", RF: "Right front", LR: "Left rear", RR: "Right rear"};
 
-function line(id, labels, datasets, opts = {}) {
+// All cow charts share one x-axis style: dates only ("21 Oct"), at most 8, never rotated.
+// The full milking time ("21 Oct 06:00") is shown in the hover tooltip.
+function line(id, rows, datasets, opts = {}) {
   new Chart(document.getElementById(id), {
-    type: "line", data: {labels, datasets},
-    options: {scales: {x: {ticks: {maxTicksLimit: 8, autoSkip: true}}, y: opts.y || {}},
-              plugins: {legend: {display: datasets.length > 1, position: "bottom"}}, spanGaps: true}
+    type: "line", data: {labels: rows.map(r => r.label), datasets},
+    options: {
+      scales: {
+        x: {ticks: {maxTicksLimit: window.innerWidth < 576 ? 5 : 8,   // fewer dates on a phone
+                    autoSkip: true, maxRotation: 0, minRotation: 0,
+                    callback: (value, index) => rows[index] ? rows[index].day : ""}},
+        y: opts.y || {}},
+      plugins: {legend: {display: datasets.length > 1, position: "bottom"},
+                tooltip: {callbacks: {title: items => items.length ? rows[items[0].dataIndex].label : ""}}},
+      spanGaps: true}
   });
 }
 
 fetch("/api/cows/{{ cow.id }}/readings?days=30").then(r => r.json()).then(rows => {
-  const labels = rows.map(r => r.label);
   const risk = [{label: "Risk score", data: rows.map(r => r.risk_score), borderColor: "#2a78d6",
                  pointRadius: rows.map(r => r.alert ? 4 : 0), pointBackgroundColor: "#d03b3b"}];
   if (THRESHOLD) risk.push({label: "Alert threshold", data: rows.map(() => THRESHOLD),
                             borderColor: "#898781", borderDash: [6, 4], borderWidth: 1.5});
-  line("riskChart", labels, risk, {y: {min: 0, max: 1}});
-  line("ecChart", labels, ["LF", "RF", "LR", "RR"].map(q => ({
+  line("riskChart", rows, risk, {y: {min: 0, max: 1}});
+  line("ecChart", rows, ["LF", "RF", "LR", "RR"].map(q => ({
     label: `${q} (${NAMES[q]})`, data: rows.map(r => r["ec_" + q]), borderColor: Q[q], backgroundColor: Q[q]})));
-  line("phChart", labels, [{label: "pH", data: rows.map(r => r.ph), borderColor: "#2a78d6"}]);
-  line("tempChart", labels, [{label: "Temperature", data: rows.map(r => r.milk_temp_c), borderColor: "#eb6834"}]);
+  line("phChart", rows, [{label: "pH", data: rows.map(r => r.ph), borderColor: "#2a78d6"}]);
+  line("tempChart", rows, [{label: "Temperature", data: rows.map(r => r.milk_temp_c), borderColor: "#eb6834"}]);
 });
 </script>
 {% endblock %}

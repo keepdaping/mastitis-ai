@@ -25,7 +25,8 @@ GROUPS = {
 # model can learn odd farm-level associations; we never tell a farmer e.g. that
 # zero-grazing protects the cow.
 RISK_ONLY = {"breed", "grazing", "parity", "lactation_stage"}
-MIN_EFFECT = 0.005           # smaller contributions would print as "+0.00"
+MIN_EFFECT = 0.03            # reasons with |effect| below this are too small to mention ...
+                             # ... except that at least one reason is always returned
 
 
 def _text(group: str, up: bool, f: dict, quarter: str | None, has_history: bool = True) -> str:
@@ -92,7 +93,7 @@ def top_reasons(shap_row, feature_names, feature_values: dict, quarter, risk_lev
     picked = []
     for group, cols in GROUPS.items():
         total = float(sum(contrib[c] for c in cols))
-        if abs(total) < MIN_EFFECT or (total > 0) != want_up:
+        if total == 0 or (total > 0) != want_up:
             continue
         if group in RISK_ONLY and total < 0:
             continue
@@ -101,8 +102,11 @@ def top_reasons(shap_row, feature_names, feature_values: dict, quarter, risk_lev
         picked.append((abs(total), {"feature": main, "effect": f"{total:+.2f}",
                                     "text": _text(group, total > 0, feature_values, quarter, has_history)}))
     picked.sort(key=lambda p: p[0], reverse=True)
-    if picked:
-        return [r for _, r in picked[:n]]
+    strong = [r for size, r in picked if size >= MIN_EFFECT]
+    if strong:
+        return strong[:n]
+    if picked:                       # all below 0.03: keep only the biggest one
+        return [picked[0][1]]
 
     # Fallback: nothing clearly pushes in the expected direction (e.g. a "medium" score that is
     # still below the model's average). Never return an empty list: report the single feature

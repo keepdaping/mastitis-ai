@@ -1,9 +1,23 @@
-{# Risk badge: colour + text, so it is never colour-only (colour-blind / projector friendly) #}
+{# Risk badge: the LEVEL in a coloured badge (colour + text, never colour-only), the score as small
+   muted text next to it. The score is capped at 0.99 for display: it is a model output, not a
+   probability, and "1.00" would wrongly suggest certainty. #}
 {% macro risk_badge(level, score=None) -%}
-  {%- if level == "high" -%}<span class="badge risk risk-high">HIGH{% if score is not none %} {{ "%.2f"|format(score) }}{% endif %}</span>
-  {%- elif level == "medium" -%}<span class="badge risk risk-medium">MEDIUM{% if score is not none %} {{ "%.2f"|format(score) }}{% endif %}</span>
-  {%- elif level == "low" -%}<span class="badge risk risk-low">LOW{% if score is not none %} {{ "%.2f"|format(score) }}{% endif %}</span>
+  {%- if level in ("high", "medium", "low") -%}
+    <span class="text-nowrap" title="Risk score (model output, not a probability)">
+      <span class="badge risk risk-{{ level }}">{{ level|upper }}</span>
+      {%- if score is not none %} <span class="risk-score">{{ "%.2f"|format([score, 0.99]|min) }}</span>{% endif -%}
+    </span>
   {%- else -%}<span class="badge text-bg-light border">no data</span>{%- endif -%}
+{%- endmacro %}
+
+{# Alert column: see alert_state() in app/routes/dashboard.py #}
+{% macro alert_badge(state) -%}
+  {%- if state == "open_alert" -%}<a href="/alerts" class="badge alert-open text-decoration-none">open alert</a>
+  {%- elif state == "recovering" -%}<a href="/alerts" class="badge alert-recovering text-decoration-none">recovering</a>
+  {%- elif state == "treated" -%}<span class="badge alert-closed" title="Closed by the farmer; no new alert until a normal reading">treated</span>
+  {%- elif state == "false_alarm" -%}<span class="badge alert-closed" title="Closed by the farmer; no new alert until a normal reading">false alarm</span>
+  {%- elif state == "watch" -%}<span class="badge alert-watch">watch – 1 high reading</span>
+  {%- endif -%}
 {%- endmacro %}
 
 {% macro status_badge(status) -%}

@@ -37,10 +37,23 @@ class Base(DeclarativeBase):
     pass
 
 
+# Columns added after the first release: (table, column, SQL type). init_db() adds them to
+# an existing database so it keeps working without a reset.
+ADDED_COLUMNS = [
+    ("readings", "baseline_exclude", "BOOLEAN DEFAULT 0"),
+    ("alerts", "closed_after_reading_id", "INTEGER REFERENCES readings(id)"),
+]
+
+
 def init_db():
-    """Create all tables that don't exist yet."""
+    """Create all tables that don't exist yet, and add columns introduced later."""
     from app import models  # noqa: F401  (registers the tables on Base)
     Base.metadata.create_all(engine)
+    with engine.begin() as con:
+        for table, column, sql_type in ADDED_COLUMNS:
+            existing = {row[1] for row in con.exec_driver_sql(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                con.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
 def reset_db():

@@ -10,7 +10,14 @@ Input columns (one row per milking):
   cow_id, timestamp, breed, parity, days_in_milk, grazing_system,
   ec_lf, ec_rf, ec_lr, ec_rr, ph, milk_temp_c, milk_yield_l
 Optional: ec_ms_cm (whole-milk EC), used only when all four quarter readings are missing.
+Optional: baseline_exclude (bool) - readings that must NOT count towards the cow's "normal"
+          (high-risk readings and readings during an open alert episode; see ml/episodes.py).
 Missing values (NaN) are allowed anywhere in the sensor columns.
+
+CLEAN BASELINE: ec/yield/temp "vs baseline" compare the current milking with the cow's own
+normal = mean of her previous CLEAN readings (never the current one, never future ones):
+  last 7 days if it has >= 3 clean readings, else last 21 days if >= 3, else the herd median.
+This stops a long infection from slowly becoming the cow's "normal".
 """
 import warnings
 
@@ -22,6 +29,8 @@ EC_COLS = [f"ec_{q}" for q in QUARTERS]
 BREEDS = ["exotic", "local"]
 GRAZING = ["zero", "tethered", "open"]
 BASELINE_WINDOW = "7D"          # rolling window for the cow's own "normal"
+BASELINE_WINDOW_LONG = "21D"    # used when the last 7 days have too few clean readings
+MIN_CLEAN_READINGS = 3          # fewer than this -> extend the window, then herd median
 YIELD_WINDOW = "3D"
 
 # Final feature list, in the exact order the model expects
@@ -65,13 +74,24 @@ def _quarter_features(ec: pd.DataFrame) -> pd.DataFrame:
                          "ec_quarter_diff": diff, "ec_quarter_ratio": ratio}, index=ec.index)
 
 
-def _rolling_prev_mean(df: pd.DataFrame, col: str, window: str) -> pd.Series:
-    """Per-cow mean of `col` over the previous `window`, EXCLUDING the current milking."""
+def _rolling_prev_mean(df: pd.DataFrame, col: str, window: str, min_periods: int = 1) -> pd.Series:
+    """Per-cow mean of `col` over the previous `window`, EXCLUDING the current milking.
+    NaN values are skipped and don't count towards min_periods."""
     out = pd.Series(np.nan, index=df.index)
     for _, g in df.groupby("cow_id", sort=False):
         s = g.set_index("timestamp")[col]
-        out.loc[g.index] = s.rolling(window, closed="left", min_periods=1).mean().to_numpy()
+        out.loc[g.index] = s.rolling(window, closed="left", min_periods=min_periods).mean().to_numpy()
     return out
+
+
+def _clean_baseline(df: pd.DataFrame, col: str) -> pd.Series:
+    """The cow's normal for `col` from previous CLEAN readings: 7 days (>= 3 readings),
+    else 21 days (>= 3 readings), else NaN (-> herd median)."""
+    clean = df[col].where(~df["_exclude"])              # excluded readings become NaN = ignored
+    tmp = df[["cow_id", "timestamp"]].assign(_v=clean)
+    short = _rolling_prev_mean(tmp, "_v", BASELINE_WINDOW, MIN_CLEAN_READINGS)
+    long = _rolling_prev_mean(tmp, "_v", BASELINE_WINDOW_LONG, MIN_CLEAN_READINGS)
+    return short.fillna(long)
 
 
 def _pct_change(current: pd.Series, baseline: pd.Series) -> pd.Series:
@@ -99,10 +119,14 @@ def build_features(df: pd.DataFrame, reference: dict | None = None) -> pd.DataFr
         feats["ec_mean"] = feats["ec_mean"].fillna(pd.to_numeric(df["ec_ms_cm"], errors="coerce"))
     df["ec_mean"] = feats["ec_mean"]
 
-    # 2) Baselines: the cow's own rolling 7-day mean (previous milkings only)
+    # 2) Baselines: the cow's own normal from previous CLEAN milkings (see module docstring)
+    if "baseline_exclude" in df:
+        df["_exclude"] = df["baseline_exclude"].fillna(False).astype(bool)
+    else:
+        df["_exclude"] = False
     for col in ["ec_mean", "milk_temp_c", "milk_yield_l"]:
-        base = _rolling_prev_mean(df, col, BASELINE_WINDOW)
-        # No history -> fall back to the herd median for that breed
+        base = _clean_baseline(df, col)
+        # Too little clean history -> fall back to the herd median for that breed
         herd = df["breed"].map(lambda b: ref["baseline"].get(b, ref["baseline"]["exotic"])[col])
         df[f"_base_{col}"] = base.fillna(herd)
 

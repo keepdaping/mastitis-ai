@@ -133,9 +133,26 @@ demo only. They are **never** used as model inputs.
 ## 2. Features (`ml/features.py`)
 
 `ec_mean, ec_max, ec_quarter_diff` (highest quarter minus the mean of the others), `ec_quarter_ratio`,
-`ec_vs_baseline / yield_vs_baseline / temp_vs_baseline` (% change vs the cow's own rolling 7-day
-mean, **previous milkings only**), `ph, milk_temp_c, milk_yield_l, yield_change_3d, parity,
-days_in_milk`, one-hot `breed_*` and `grazing_*`.
+`ec_vs_baseline / yield_vs_baseline / temp_vs_baseline` (% change vs the cow's own **clean baseline**,
+see below), `ph, milk_temp_c, milk_yield_l, yield_change_3d, parity, days_in_milk`, one-hot `breed_*`
+and `grazing_*`.
+
+**Clean baseline (model v2).** A cow's "normal" is the mean of her previous **clean** readings:
+the last 7 days if there are at least 3, otherwise the last 21 days if there are at least 3, otherwise
+the herd median for her breed. A reading is *not clean* if it was high risk, or if an alert episode was
+active at the time. Without this, a 3-week infection slowly becomes the cow's "normal" and
+`ec_vs_baseline` drifts back to 0 while she is still sick.
+
+* **Live service:** each reading's flag is stored in `readings.baseline_exclude` when it is processed
+  (`app/service.py`), from the model's own risk level and the episode state.
+* **Training** needs the same flag for every historical reading, and that needs a risk level. A
+  **stage-0 model** (RandomForest, plain baseline) scores every reading **out-of-farm**: training
+  farms by 5-fold GroupKFold, test farms by a model trained on the training farms. Its high/low
+  calls are replayed through the same episode rules as the API (`ml/episodes.py`), and the final
+  models are trained on the clean-baseline features. Every flag uses only the current and earlier
+  readings, so there is no future leakage.
+* Stage 0 excluded 29.9% of all readings: 99.5% of truly infected readings, and 18.6% of healthy ones.
+  Its threshold is tuned for recall, so it is cautious, and every cow still keeps plenty of clean readings.
 
 * **Missing values:** EC summaries use the quarters available; ph/temp/yield are carried forward from
   the cow's last reading, and anything still missing falls back to herd medians.
@@ -155,23 +172,39 @@ days_in_milk`, one-hot `breed_*` and `grazing_*`.
   precision >= 0.5 (tie-break ROC-AUC).
 * **Decision threshold** is tuned on out-of-fold predictions: the highest threshold that still
   gives recall >= 0.85.
+* Before all of this, the stage-0 model creates the clean-baseline flags (see section 2).
 
 ## 4. Results (SIMULATED data)
 
-**Selected model: RandomForest + SMOTE**, threshold 0.386.
+**Selected model: RandomForest + SMOTE (`rf-smote-v2`, clean baseline)**, threshold 0.416.
 
 Held-out farms F02 + F09 (1,543 labelled milkings, 328 positive):
 
 | model | accuracy | precision | recall | F1 | ROC-AUC | specificity | threshold |
 |---|---|---|---|---|---|---|---|
-| LogReg + class_weight | 0.772 | 0.481 | 0.927 | 0.633 | 0.948 | 0.730 | 0.274 |
-| LogReg + SMOTE | 0.758 | 0.465 | 0.924 | 0.618 | 0.948 | 0.713 | 0.268 |
-| RandomForest + class_weight | 0.855 | 0.608 | 0.902 | 0.726 | 0.940 | 0.843 | 0.205 |
-| **RandomForest + SMOTE** | **0.927** | **0.793** | **0.887** | **0.837** | **0.946** | **0.937** | 0.386 |
-| XGBoost + scale_pos_weight | 0.800 | 0.517 | 0.890 | 0.654 | 0.932 | 0.775 | 0.138 |
-| XGBoost + SMOTE | 0.921 | 0.775 | 0.884 | 0.826 | 0.940 | 0.931 | 0.157 |
+| LogReg + class_weight | 0.827 | 0.556 | 0.924 | 0.694 | 0.947 | 0.801 | 0.289 |
+| LogReg + SMOTE | 0.809 | 0.529 | 0.927 | 0.673 | 0.947 | 0.777 | 0.277 |
+| RandomForest + class_weight | 0.843 | 0.584 | 0.902 | 0.709 | 0.936 | 0.826 | 0.187 |
+| **RandomForest + SMOTE** | **0.945** | **0.865** | **0.878** | **0.871** | **0.946** | **0.963** | 0.416 |
+| XGBoost + scale_pos_weight | 0.756 | 0.462 | 0.902 | 0.611 | 0.927 | 0.716 | 0.117 |
+| XGBoost + SMOTE | 0.931 | 0.811 | 0.878 | 0.843 | 0.938 | 0.945 | 0.192 |
 
-Best model confusion matrix (test farms): TP 291, FN 37, FP 76, TN 1,139.
+Best model confusion matrix (test farms): TP 288, FN 40, FP 45, TN 1,170.
+
+**Effect of the clean baseline** (selected model, held-out farms, v1 → v2):
+
+| | v1 (plain 7-day baseline) | v2 (clean baseline) | change |
+|---|---|---|---|
+| Recall | 0.887 | 0.878 | -0.009 (3 more missed of 328) |
+| Precision | 0.793 | 0.865 | +0.072 |
+| Specificity | 0.937 | 0.963 | +0.026 |
+| False alarms | 76 | 45 | -41% |
+| ROC-AUC | 0.946 | 0.946 | 0 |
+
+Details and the explanation: [reports/baseline_v1_vs_v2.md](reports/baseline_v1_vs_v2.md).
+Overall *ranking* (ROC-AUC) is unchanged, but at the operating point the model raises far fewer false
+alarms for almost the same recall. One train/test split on simulated data: treat ±0.01 differences
+as noise.
 
 See `reports/` for `test_comparison.*`, `cv_comparison.md`, `confusion_matrix.png`,
 `roc_curves.png`, `shap_summary.png` and `metrics.json`.
@@ -207,12 +240,13 @@ In short:
   `ml/features.py`: other quarters → whole-milk `ec_ms_cm` → the cow's 7-day average → herd median.
 * **`cmt_score`** (optional, 0-4) is stored with the reading as a future training label. It is not used
   for the prediction.
-* **`risk_level`** is per reading: `low < 0.4 <= medium < threshold <= high`. The tuned threshold is
-  0.386, so the medium band currently starts at half of it (0.193). `/model-info` → `risk_bands`.
+* **`risk_level`** is per reading: `low < 0.25 <= medium < threshold <= high`. The tuned threshold is
+  0.416, so today: low < 0.25 <= medium < 0.416 <= high. `/model-info` → `risk_bands`.
 * **`alert`** is `true` only for **2 consecutive `high` readings** of the same cow (at most 48 h apart).
   One noisy spike never alerts. Only `alert: true` should trigger an SMS.
-* **`model_version`** comes from the saved model metadata (`rf-smote-v1` = RandomForest + SMOTE,
-  version 1; set by `MODEL_VERSION` in `ml/train.py`).
+* **`model_version`** comes from the saved model metadata (`rf-smote-v2` = RandomForest + SMOTE,
+  version 2; set by `MODEL_VERSION` in `ml/train.py`).
+* **`top_reasons`** leaves out reasons with |effect| < 0.03, but always returns at least one.
 * **Storage:** every reading, with its risk score, level, alert flag, reasons and model version, is saved
   in `data/app.db` (SQLAlchemy). It is keyed on (cow, timestamp), so re-sending a milking replaces it.
 * **`days_in_milk`** may be omitted for a cow whose calving date is on record (it's calculated). This is
@@ -233,7 +267,7 @@ row). The dashboard treats that run as **one episode**:
 | `alert: true`, cow has no active alert | new `alerts` row (status `open`) + **one SMS** |
 | `alert: true`, cow already has an active alert | reading attached to it (`last_reading_id`, `reading_count += 1`), no SMS |
 | 4 consecutive non-high readings while active | status `resolved_auto` (episode over) |
-| Farmer marks `treated` or `false_alarm` | episode closed. If the cow goes high again later, that is a **new** episode and a new SMS |
+| Farmer marks `treated` or `false_alarm` | episode closed. No new episode while the cow is *still* high (antibiotics take days): it needs one non-high reading first ("re-arm"). If the cow goes high again after that, it's a **new** episode and a new SMS |
 | Farmer marks `checked` | still active (acknowledged, not finished), so no new SMS while it continues |
 
 `/alerts` and the cow page show each episode's length: first → latest reading, number of readings and hours.
@@ -263,7 +297,11 @@ URL at `https://<your-tunnel>/ussd` (e.g. via ngrok).
 **Seed data** (`scripts/seed_db.py`): farms F02 and F09 (the held-out test farms) and F04, with 10 cows
 each (about half with an infection in the window), last 30 simulated days, replayed through
 `handle_reading()`. Timestamps are shifted so the history ends today. Farm names, owners and phone
-numbers are fictional.
+numbers are fictional. Farmer behaviour is simulated as well. Each episode that starts more than
+3 days before today gets a fate: ~60% `treated` ("Treated by vet, intramammary antibiotic"), ~15%
+`false_alarm`, the rest left open. The farmer acts 12-36 h after the alert. A treated cow's remaining
+infected readings are replaced by healthy ones (her own healthy levels + sensor noise) from 5-10 days
+after treatment.
 
 ## 7. Terminal demo (simulator)
 

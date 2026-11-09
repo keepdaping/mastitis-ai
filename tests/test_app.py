@@ -214,3 +214,110 @@ def test_ussd_menu_cmt_and_treat(client, spike_reading):
     assert ussd(client, "3*1") == "END Alert for TF-U-C042 marked as treated."
     assert alerts_for("TF-U-C042")[0].status == "treated"
     assert ussd(client, "", phone="+256711111111").startswith("END This phone number is not registered")
+
+
+# ---------------------------------------------------------------- herd table badges + cards
+def card_value(html, label):
+    import re
+    m = re.search(r'<div class="value[^"]*">(\d+)</div>\s*<div class="label">' + re.escape(label), html)
+    assert m, label
+    return int(m.group(1))
+
+
+def test_alert_states_and_cards_match_table(client, spike_reading, healthy_reading):
+    make_farm("TF-K")
+    state = lambda: {c["tag"]: c["alert_state"] for c in client.get("/api/cows?farm=TF-K").json()}
+    send(client, spike_reading, "K-1", "TF-K", 0)
+    send(client, healthy_reading, "K-2", "TF-K", 0)
+    assert state() == {"K-1": "watch", "K-2": None}                  # first high reading
+    send(client, spike_reading, "K-1", "TF-K", 12)
+    send(client, spike_reading, "K-2", "TF-K", 12)
+    assert state() == {"K-1": "open_alert", "K-2": "watch"}          # 2 highs in a row -> alert
+    send(client, healthy_reading, "K-1", "TF-K", 24)
+    assert state()["K-1"] == "recovering"                            # alert open, latest not high
+
+    html = client.get("/?farm=TF-K").text
+    assert "recovering</a>" in html and "watch – 1 high reading" in html
+    assert "Recovering = alert still open, latest reading not high" in html
+    rows = client.get("/api/cows?farm=TF-K").json()
+    assert card_value(html, "High risk today") == sum(r["risk_level"] == "high" for r in rows) == 1
+    assert card_value(html, "Open alerts") == 1                      # recovering counts as open
+    assert "recovering" in client.get(f"/cows/{rows[0]['id']}").text or \
+           "recovering" in client.get(f"/cows/{rows[1]['id']}").text
+
+
+def test_risk_badge_shows_level_and_capped_score():
+    from app.routes.dashboard import templates
+    badge = templates.env.get_template("_macros.html").module.risk_badge
+    html = str(badge("high", 1.0))
+    assert ">HIGH<" in html and "0.99" in html and "1.00" not in html
+    assert 'title="Risk score (model output, not a probability)"' in html
+    assert '<span class="risk-score">0.42</span>' in str(badge("medium", 0.4213))
+    assert "no data" in str(badge(None))
+
+
+# ---------------------------------------------------------------- re-arm after treatment, baseline flag
+def test_no_new_alert_while_cow_still_high_after_treatment(client, spike_reading, healthy_reading):
+    make_farm("TF-R")
+    send(client, spike_reading, "RA-1", "TF-R", 0)
+    send(client, spike_reading, "RA-1", "TF-R", 12)
+    first = alerts_for("RA-1")[0]
+    client.patch(f"/api/alerts/{first.id}", json={"status": "treated", "note": "vet"})
+    for h in (24, 36, 48):                                     # antibiotics take time: still high
+        assert send(client, spike_reading, "RA-1", "TF-R", h)["alert"] is True   # contract unchanged
+    assert len(alerts_for("RA-1")) == 1 and len(sms_for("RA-1")) == 1          # but no new episode/SMS
+    assert client.get("/api/cows?farm=TF-R").json()[0]["alert_state"] == "treated"
+    send(client, healthy_reading, "RA-1", "TF-R", 60)          # recovered -> re-armed
+    send(client, spike_reading, "RA-1", "TF-R", 72)
+    send(client, spike_reading, "RA-1", "TF-R", 84)
+    assert len(alerts_for("RA-1")) == 2 and [m.status for m in sms_for("RA-1")] == ["sent", "sent"]
+
+
+def test_high_and_episode_readings_are_flagged_for_the_baseline(client, spike_reading, healthy_reading):
+    make_farm("TF-S")
+    send(client, healthy_reading, "BF-1", "TF-S", 0)
+    send(client, spike_reading, "BF-1", "TF-S", 12)
+    send(client, spike_reading, "BF-1", "TF-S", 24)            # alert -> episode opens
+    send(client, healthy_reading, "BF-1", "TF-S", 36)          # recovering, episode still active
+    flags = [r.baseline_exclude for r in readings_for("BF-1")]
+    assert flags == [False, True, True, True]
+
+
+def test_reasons_below_003_are_dropped_but_never_empty():
+    from api.reasons import top_reasons
+    from ml.features import FEATURES
+    values = {f: 0.0 for f in FEATURES} | {"breed_exotic": 1, "grazing_zero": 1, "parity": 2, "ph": 7.0,
+                                           "ec_quarter_diff": 2.0, "milk_temp_c": 38.0}
+    shap = {f: 0.0 for f in FEATURES} | {"ec_quarter_diff": 0.20, "ph": 0.05, "milk_temp_c": 0.02}
+    out = top_reasons([shap[f] for f in FEATURES], FEATURES, values, "lr", "high")
+    assert [r["feature"] for r in out] == ["ec_quarter_diff", "ph"]          # +0.02 dropped
+    tiny = {f: 0.0 for f in FEATURES} | {"ph": 0.01, "milk_temp_c": 0.02}
+    out = top_reasons([tiny[f] for f in FEATURES], FEATURES, values, "lr", "high")
+    assert len(out) == 1 and out[0]["effect"] == "+0.02"                     # biggest one kept
+
+
+def test_cow_chart_api_gives_date_labels(client, healthy_reading):
+    send(client, healthy_reading, "CH-1", "TF-T", 0)
+    cow_id = readings_for("CH-1")[0].cow_id
+    row = client.get(f"/api/cows/{cow_id}/readings").json()[0]
+    assert row["day"] == "01 Mar" and row["label"] == "01 Mar 06:00"
+
+
+def test_seed_treatment_makes_later_readings_healthy():
+    import numpy as np
+    import pandas as pd
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from seed_db import healthy_levels, recover_after_treatment
+    ts = pd.date_range("2026-03-01 06:00", periods=8, freq="12h")
+    infected = [None, None, "lr", "lr", "lr", "lr", None, None]
+    rows = pd.DataFrame({"cow_id": "C1", "timestamp": ts, "ec_lf": 5.0, "ec_rf": 5.0,
+                         "ec_lr": [5.0, 5.0, 8, 8, 8, 8, 5.0, 5.0], "ec_rr": 5.0, "ph": 6.7,
+                         "milk_temp_c": 37.5, "cmt_score": [np.nan, np.nan, 3, np.nan, 3, np.nan, np.nan, 0],
+                         "true_infected": [0, 0, 1, 1, 1, 1, 0, 0], "true_infected_quarters": infected})
+    rows["true_infected_quarters"] = rows["true_infected_quarters"].astype(object)
+    levels = healthy_levels(rows)
+    changed = recover_after_treatment(rows, 3, "C1", ts[4], levels, np.random.default_rng(0))
+    assert changed == 2                                          # readings 4 and 5 (from recovery on)
+    assert rows.loc[3, "ec_lr"] == 8                             # before recovery: still infected
+    assert rows.loc[4:5, "ec_lr"].between(4, 6).all() and (rows.loc[4:5, "true_infected"] == 0).all()
+    assert rows.loc[4, "cmt_score"] in (0, 1, 2)

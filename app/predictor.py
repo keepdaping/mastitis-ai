@@ -17,12 +17,12 @@ from ml.features import build_features
 
 ROOT = Path(__file__).resolve().parent.parent
 MODEL_PATH = Path(os.getenv("MASTITIS_MODEL", ROOT / "models" / "mastitis_model.joblib"))
-MEDIUM_FROM = 0.4            # low < 0.4 <= medium < threshold <= high (see medium_floor)
+MEDIUM_FROM = 0.25           # low < 0.25 <= medium < threshold <= high (see medium_floor)
 
 
 def medium_floor(threshold: float) -> float:
-    """Start of the 'medium' band: 0.4 as specified. If the tuned threshold is itself
-    <= 0.4 the medium band would be empty, so we use half the threshold instead."""
+    """Start of the 'medium' band: 0.25. If a retrained model's threshold were itself
+    <= 0.25 the medium band would be empty, so we would use half the threshold instead."""
     return MEDIUM_FROM if threshold > MEDIUM_FROM else round(threshold / 2, 3)
 
 

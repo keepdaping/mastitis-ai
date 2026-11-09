@@ -22,6 +22,7 @@ from app.db import SessionLocal
 from app.models import ACTIVE_ALERT_STATUSES, Alert, Cow, Farm, Reading, SmsLog
 from app.notify import provider_name
 from app.predictor import get_predictor, medium_floor
+from app.service import CLOSING_STATUSES, close_alert, rearmed
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 templates = Jinja2Templates(directory=ROOT / "templates")
@@ -56,6 +57,30 @@ def alert_json(a: Alert) -> dict:
             "closed_at": a.closed_at.isoformat() if a.closed_at else None}
 
 
+def alert_state(has_active_alert: bool, latest_level: str | None, closed_status: str | None = None) -> str | None:
+    """What the Alert column shows for a cow:
+       open_alert  - active alert episode and the latest reading is still high   (red)
+       recovering  - active alert episode, but the latest reading is not high    (grey-blue)
+       treated / false_alarm - farmer closed the alert and the cow is still high;
+                     no new alert until a normal reading (see app/service.rearmed)
+       watch       - latest reading is high but no alert yet (first high reading) (amber)
+       None        - nothing to show
+    closed_status: status of the cow's last farmer-closed alert if it has NOT re-armed yet."""
+    if has_active_alert:
+        return "open_alert" if latest_level == "high" else "recovering"
+    if latest_level == "high":
+        return closed_status or "watch"
+    return None
+
+
+def pending_closed_status(s: Session, cow_id: int) -> str | None:
+    """'treated' / 'false_alarm' if the cow's last farmer-closed alert hasn't re-armed yet."""
+    if rearmed(s, cow_id):
+        return None
+    return s.execute(select(Alert.status).where(Alert.cow_id == cow_id, Alert.status.in_(CLOSING_STATUSES))
+                     .order_by(Alert.id.desc()).limit(1)).scalar_one_or_none()
+
+
 def herd_rows(s: Session, farm: str | None = None) -> list[dict]:
     """One row per cow with its latest reading, highest risk first."""
     q = select(Cow).order_by(Cow.tag)
@@ -72,7 +97,10 @@ def herd_rows(s: Session, farm: str | None = None) -> list[dict]:
             "days_in_milk": r.days_in_milk if r else None,
             "latest": r.timestamp.isoformat() if r else None, "latest_fmt": fmt_time(r.timestamp if r else None),
             "risk_score": r.risk_score if r else None, "risk_level": r.risk_level if r else None,
-            "active_alert_id": active.get(cow.id)})
+            "active_alert_id": active.get(cow.id),
+            "alert_state": alert_state(
+                cow.id in active, r.risk_level if r else None,
+                pending_closed_status(s, cow.id) if (r and r.risk_level == "high" and cow.id not in active) else None)})
     rows.sort(key=lambda x: -1 if x["risk_score"] is None else x["risk_score"], reverse=True)
     return rows
 
@@ -86,19 +114,21 @@ def farm_list(s: Session) -> list[Farm]:
 def herd_overview(request: Request, farm: str | None = None):
     with SessionLocal() as s:
         rows = herd_rows(s, farm)
-        today = date.today().isoformat()
         cows_q = select(Cow.id).where(Cow.farm_id == farm) if farm else select(Cow.id)
+        # Cards are counted from the SAME rows as the table, so the numbers always match it
         cards = {
             "total_cows": len(rows),
-            "high_today": sum(1 for r in rows if r["risk_level"] == "high" and (r["latest"] or "") >= today),
-            "open_alerts": s.scalar(select(func.count(Alert.id)).where(
-                Alert.status.in_(ACTIVE_ALERT_STATUSES), Alert.cow_id.in_(cows_q))),
+            "high_today": sum(1 for r in rows if r["risk_level"] == "high"),           # rows showing HIGH
+            "open_alerts": sum(1 for r in rows if r["alert_state"] in ("open_alert", "recovering")),
             "sms_week": s.scalar(select(func.count(SmsLog.id)).where(
                 SmsLog.status == "sent", SmsLog.created_at >= datetime.now() - timedelta(days=7),
                 SmsLog.cow_id.in_(cows_q))),
         }
+        p = get_predictor()
+        bands = {"medium": medium_floor(p.threshold), "high": p.threshold} if p else None
         return templates.TemplateResponse(request, "index.html", {
-            "rows": rows, "cards": cards, "farms": farm_list(s), "farm": farm, "page": "herd"})
+            "rows": rows, "cards": cards, "farms": farm_list(s), "farm": farm, "bands": bands,
+            "page": "herd"})
 
 
 @router.get("/cows/{cow_id}", response_class=HTMLResponse)
@@ -112,8 +142,12 @@ def cow_detail(request: Request, cow_id: int):
         episodes = [alert_json(a) for a in s.execute(
             select(Alert).where(Alert.cow_id == cow.id).order_by(Alert.id.desc())).scalars()]
         p = get_predictor()
+        latest = readings[0] if readings else None
+        has_active = any(e["status"] in ACTIVE_ALERT_STATUSES for e in episodes)
         return templates.TemplateResponse(request, "cow.html", {
-            "cow": cow, "farm": cow.farm, "readings": readings, "latest": readings[0] if readings else None,
+            "cow": cow, "farm": cow.farm, "readings": readings, "latest": latest,
+            "alert_state": alert_state(has_active, latest.risk_level if latest else None,
+                                       pending_closed_status(s, cow.id) if not has_active else None),
             "episodes": episodes, "threshold": p.threshold if p else None,
             "cmt_scale": CMT_FIELD_SCALE, "page": "herd"})
 
@@ -213,6 +247,7 @@ def api_cow_readings(cow_id: int, days: int = 30):
         rows = s.execute(select(Reading).where(Reading.cow_id == cow.id, Reading.timestamp >= since)
                          .order_by(Reading.timestamp)).scalars().all()
         return [{"timestamp": r.timestamp.isoformat(), "label": fmt_time(r.timestamp),
+                 "day": r.timestamp.strftime("%d %b"),           # x-axis ticks: dates only
                  "risk_score": r.risk_score, "risk_level": r.risk_level, "alert": r.alert,
                  "ec_LF": r.ec_LF, "ec_RF": r.ec_RF, "ec_LR": r.ec_LR, "ec_RR": r.ec_RR,
                  "ph": r.ph, "milk_temp_c": r.milk_temp_c, "milk_yield_l": r.milk_yield_l,
@@ -240,12 +275,9 @@ def api_update_alert(alert_id: int, body: AlertUpdate):
         a = s.get(Alert, alert_id)
         if a is None:
             raise HTTPException(404, "Alert not found")
-        a.status = body.status
-        if body.note:
-            a.note = body.note
-        # treated / false_alarm close the episode: the next high readings start a NEW episode.
-        # False alarms are kept (not deleted) as negative examples for future retraining.
-        a.closed_at = None if body.status == "checked" else datetime.now().replace(microsecond=0)
+        # treated / false_alarm close the episode. A NEW episode can start once the cow has had a
+        # normal reading again. False alarms are kept (not deleted) as negative examples for retraining.
+        close_alert(s, a, body.status, body.note)
         s.commit()
         return alert_json(a)
 
