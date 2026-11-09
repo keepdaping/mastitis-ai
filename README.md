@@ -5,38 +5,74 @@ using in-line milk sensors: electrical conductivity (EC) per quarter, pH, milk t
 One FastAPI app serves the prediction API, a farmer/vet web dashboard, SMS alerts and a USSD menu.
 
 > ⚠️ **ALL DATA IN THIS REPOSITORY IS SIMULATED.**
-> `data/synthetic_milkings.csv` is produced by `data/generate_synthetic.py`. No real farm,
+> `data/synthetic_milkings.csv` is produced by `ml/generate_synthetic.py`. No real farm,
 > cow or sensor data has been used. All results below describe performance on **simulated**
 > data only, and they will be optimistic compared with real field data.
 
-## Project structure
+## Architecture
+
+Three layers, each depending only on the ones below it:
 
 ```
-data/generate_synthetic.py   synthetic dataset generator (all parameters in CONFIG at the top)
-ml/features.py               build_features(): the ONE feature function used by training AND the API
-ml/train.py                  farm-level split, 3 models x 2 imbalance strategies, CV, threshold tuning
-ml/evaluate.py               test-farm metrics, confusion matrix, ROC curves, SHAP, metrics.json
-ml/explain.py                SHAP helper shared by evaluate.py and the API
-api/schemas.py               request/response contract (Pydantic) - see docs/API_CONTRACT.md
-api/reasons.py               SHAP -> plain-English reasons + advice text
-api/main.py                  the FastAPI app: /predict API + dashboard + USSD routers
-app/db.py, app/models.py     SQLite via SQLAlchemy: farms, cows, readings, alerts, sms_log
-app/service.py               handle_reading(): save reading -> model -> alert episode -> SMS
-app/predictor.py             loads the model once, scores one reading
-app/notify.py                send_sms() (console | Africa's Talking) + 12 h per-cow limit
-app/sms_templates.py         SMS texts by language ("en"; "lg" Luganda placeholder)
-app/routes/dashboard.py      dashboard pages + JSON API (/api/...)
-app/routes/ussd.py           Africa's Talking USSD menu (optional)
-app/demo.py                  "Start live demo" replay for /demo
-templates/, static/          Jinja2 + Bootstrap 5 + Chart.js (CDN), no build step
-scripts/seed_db.py           fills data/app.db with 3 farms x 10 cows x 30 days of history
-simulator/send_readings.py   fake sensor that POSTs to /predict (terminal demo)
-models/                      mastitis_model.joblib, candidates.joblib, metadata.json
-reports/                     comparison tables, plots, metrics.json
-docs/API_CONTRACT.md         API contract: the single source of truth for API, dashboard and SMS
-examples/                    predict_request.json / predict_response.json
-tests/                       pytest
+api/  HTTP layer      routes parse input, call app/, return the result (no business logic)
+app/  domain layer    database, reading pipeline, alert episodes, SMS, dashboard data, USSD menu
+ml/   ML layer        synthetic data, features, training, evaluation, SHAP
+      app/config.py   shared constants (risk bands, alert rules, quarter names, valid ranges),
+                      imported by all three layers; it imports nothing from the project
 ```
+
+```
+api/
+  main.py                FastAPI app: middleware, static files, error handler, routers
+  schemas.py             request/response contract (Pydantic) - human version: docs/API_CONTRACT.md
+  errors.py              the 422 error format
+  routes/predict.py      POST /predict, GET /health, GET /model-info, GET /history/{cow_id}
+  routes/dashboard.py    pages /, /cows/{id}, /alerts, /cmt, /model, /demo, /sms + JSON /api/...
+  routes/ussd.py         POST /ussd (Africa's Talking callback)
+app/
+  config.py              shared constants (one place for every rule and limit)
+  db.py, models.py       SQLite via SQLAlchemy: farms, cows, readings, alerts, sms_log
+  service.py             handle_reading(): the reading pipeline (+ data for /history, /model-info)
+  predictor.py           loads the model once, scores one reading, risk bands
+  reasons.py             SHAP values -> plain-English reasons + advice
+  alerts.py              alert episodes: open / attach / auto-resolve / farmer close / re-arm
+  notify.py              send_sms() (console | Africa's Talking), 12 h per-cow limit, sms_log
+  sms_templates.py       SMS texts by language ("en"; "lg" Luganda placeholder)
+  dashboard.py           queries and page data for the dashboard
+  ussd.py                USSD menu logic
+  replay.py              synthetic CSV row -> /predict request (seed, demo, simulator)
+  seeding.py             seed the database with 30 days of replayed history + farmer actions
+  demo.py                "Start live demo" background replay
+ml/
+  generate_synthetic.py  synthetic dataset generator (all parameters in CONFIG)
+  features.py            build_features(): the ONE feature function used by training AND the API
+  episodes.py            the alert/episode rules replayed over history (clean-baseline flags)
+  train.py               farm-level split, stage-0 flags, 3 models x 2 imbalance strategies, CV, threshold
+  evaluate.py            test-farm metrics, confusion matrix, ROC curves, SHAP, metrics.json
+  explain.py             SHAP helper shared by evaluate.py and the API
+scripts/seed_db.py       command line for app/seeding.py
+simulator/send_readings.py  fake sensor that POSTs to /predict (terminal demo)
+templates/, static/      Jinja2 + Bootstrap 5 + Chart.js (CDN), no build step
+models/, reports/        trained model + metadata; comparison tables, plots, metrics.json
+docs/API_CONTRACT.md     API contract: the single source of truth for API, dashboard and SMS
+examples/                predict_request.json / predict_response.json
+tests/                   pytest
+pyproject.toml           ruff (lint + format) and pytest configuration
+```
+
+**How a reading flows through the system.** A sensor (or `simulator/send_readings.py`) sends one
+milking to **`POST /predict`**. `api/routes/predict.py` validates it against `api/schemas.py` and calls
+`app/service.handle_reading()`. The service finds or creates the cow, loads her last 22 days of readings
+from SQLite and passes history + new reading to **`ml/features.build_features()`**, the same function used
+in training, which computes quarter conductivity differences and the clean baseline. **The model**
+(`app/predictor.py`) returns a risk score and SHAP values. The score is mapped to low/medium/high with
+the bands in `app/config.py`, and **`app/reasons.py`** turns the SHAP values into up to three
+plain-English **reasons** and advice. The reading is saved, and **`app/alerts.py`** applies the episode
+rules: two high readings in a row open an **alert episode**, later highs join it, and four normal
+readings close it. Only a new episode calls **`app/notify.py`**, which sends one **SMS** (console or
+Africa's Talking) and logs it. The **dashboard** (`api/routes/dashboard.py` + `app/dashboard.py`) reads the
+same database to show the herd, each cow's history and reasons, open alerts and the SMS log. There,
+farmers mark alerts checked / treated / false alarm and enter CMT results that become future training labels.
 
 ## How to run
 
@@ -48,7 +84,7 @@ pip install -r requirements.txt
 copy .env.example .env             # Linux/macOS: cp .env.example .env  (defaults work as-is)
 
 # 1-3. ML pipeline (already done if models/ and reports/ exist)
-python data/generate_synthetic.py  # SIMULATED data -> data/synthetic_milkings.csv
+python -m ml.generate_synthetic   # SIMULATED data -> data/synthetic_milkings.csv
 python -m ml.train                 # -> models/
 python -m ml.evaluate              # -> reports/
 
@@ -60,8 +96,10 @@ uvicorn api.main:app --reload
 #    dashboard  http://127.0.0.1:8000/
 #    API docs   http://127.0.0.1:8000/docs
 
-# tests
+# tests, lint and formatting
 pytest
+ruff check .
+ruff format .
 ```
 
 ### .env
@@ -289,7 +327,7 @@ back to English until translations are added.
 **CMT entry** (`/cmt`): the score is entered on the familiar 1-5 field scale, stored as 0-4, and attached to
 the cow's last recorded milking on that date. If there is no milking that day, it is refused with a message.
 
-**USSD** (`app/routes/ussd.py`, optional): Africa's Talking callback at `POST /ussd`. The farm is
+**USSD** (`app/ussd.py` + route `api/routes/ussd.py`, optional): Africa's Talking callback at `POST /ussd`. The farm is
 identified by the caller's phone number. `1` My high-risk cows · `2` Enter CMT result (cow tag → score 1-5)
 · `3` Mark alert as treated. Responses use the `CON` / `END` format. Point the AT sandbox USSD callback
 URL at `https://<your-tunnel>/ussd` (e.g. via ngrok).

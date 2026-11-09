@@ -1,225 +1,277 @@
 """
-handle_reading(): everything that happens when a milking reading arrives.
-Used by POST /predict, scripts/seed_db.py and the /demo replay, so they behave identically.
+The reading pipeline (app/ layer): everything that happens when a milking reading arrives.
 
+handle_reading() is used by POST /predict (api/routes/predict.py), the seed script and the
+/demo replay, so they behave identically:
   1. find/create the farm and cow; work out days in milk (sent, or from calving_date)
-  2. load the cow's last 8 days of readings -> features -> model score + SHAP
-  3. alert (per reading, as in docs/API_CONTRACT.md): this AND the previous reading are high
-  4. save the reading (re-sending the same cow + timestamp updates it)
-  5. alert EPISODES:
-       alert=true and no active episode  -> new alerts row + SMS
-       alert=true and an active episode  -> attach the reading to it (no SMS)
-       4 consecutive non-high readings   -> episode auto-resolves ("resolved_auto")
-       closed by the farmer (treated / false alarm) -> no new episode until the cow has had
-       at least one NON-high reading after the closure ("re-arm")
-  6. baseline flag: a high reading, or one taken while an episode is active, is stored with
-     baseline_exclude=True so it never becomes part of the cow's "normal" (ml/features.py)
+  2. load the cow's recent readings -> features -> model score + SHAP (app/predictor.py)
+  3. alert (per reading, docs/API_CONTRACT.md): this AND the previous reading are high
+  4. farmer-friendly reasons + advice (app/reasons.py)
+  5. save the reading (re-sending the same cow + timestamp updates it)
+  6. alert episode + SMS (app/alerts.py, app/notify.py)
+  7. clean-baseline flag: a high reading, or one taken while an episode is active, is stored
+     with baseline_exclude=True so it never becomes part of the cow's "normal"
+Also here: the data behind GET /history and GET /model-info.
 """
+
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.reasons import advice, top_reasons
 from api.schemas import PredictRequest, PredictResponse
-from app.models import ACTIVE_ALERT_STATUSES, Alert, Cow, Farm, Reading
-from app.notify import notify_new_alert
-from app.predictor import get_predictor
-from ml.episodes import ALERT_MAX_GAP, AUTO_RESOLVE_AFTER   # same rules as training
+from app.alerts import active_alert, is_alert, update_episode
+from app.config import ALERT_MAX_GAP, HISTORY_DAYS, QUARTER_KEYS
+from app.models import Cow, Farm, Reading
+from app.predictor import Predictor, get_predictor, risk_bands
+from app.reasons import advice, top_reasons
 from ml.features import suspect_quarter
 
-HISTORY_DAYS = 22                      # baseline uses up to 21 days of clean readings
-QUARTERS = ["LF", "RF", "LR", "RR"]
-CLOSING_STATUSES = {"treated", "false_alarm"}
+ROOT = Path(__file__).resolve().parent.parent
+METRICS_PATH = ROOT / "reports" / "metrics.json"
+METADATA_PATH = ROOT / "models" / "metadata.json"
+TEXT_COLUMNS = ("cow_id", "timestamp", "breed", "grazing_system", "baseline_exclude")  # not cast to float
+SECONDS_PER_HOUR = 3600
 
 
-class InputProblem(Exception):
+class InvalidReadingError(Exception):
     """A request that is valid JSON but can't be processed (-> 422 with a clear message)."""
+
     def __init__(self, field: str, message: str):
         super().__init__(f"{field}: {message}")
         self.field, self.message = field, message
 
 
-class ModelNotLoaded(Exception):
-    pass
+class ModelNotLoadedError(Exception):
+    """No trained model in models/ (-> 503)."""
 
 
-# ------------------------------------------------------------------ helpers
-def get_or_create_cow(session: Session, req: PredictRequest) -> Cow:
+# --------------------------------------------------------------------------- steps
+def get_or_create_cow(session: Session, request: PredictRequest) -> Cow:
+    """The cow (and farm) for this reading, created on first sight and updated from the request."""
     farm = None
-    if req.farm_id:
-        farm = session.get(Farm, req.farm_id) or Farm(id=req.farm_id, name=req.farm_id)
+    if request.farm_id:
+        farm = session.get(Farm, request.farm_id) or Farm(id=request.farm_id, name=request.farm_id)
         session.add(farm)
-    cow = session.execute(select(Cow).where(Cow.tag == req.cow_id)).scalar_one_or_none()
+    cow = session.execute(select(Cow).where(Cow.tag == request.cow_id)).scalar_one_or_none()
     if cow is None:
-        cow = Cow(tag=req.cow_id, breed=req.breed, parity=req.parity, grazing_system=req.grazing_system)
+        cow = Cow(tag=request.cow_id, breed=request.breed, parity=request.parity, grazing_system=request.grazing_system)
         session.add(cow)
     # The latest request is the most up-to-date description of the cow
-    cow.breed, cow.parity, cow.grazing_system = req.breed, req.parity, req.grazing_system
+    cow.breed, cow.parity, cow.grazing_system = request.breed, request.parity, request.grazing_system
     if farm is not None:
         cow.farm = farm
     return cow
 
 
-def resolve_days_in_milk(cow: Cow, req: PredictRequest, ts: datetime) -> int:
-    if req.days_in_milk is not None:
-        cow.calving_date = (ts - timedelta(days=req.days_in_milk)).date()   # remember for next time
-        return req.days_in_milk
-    dim = cow.days_in_milk(ts)
-    if dim is None or dim < 0:
-        raise InputProblem("days_in_milk", f"required: cow {req.cow_id} has no calving date on record")
-    return dim
+def resolve_days_in_milk(cow: Cow, request: PredictRequest, timestamp: datetime) -> int:
+    """Days in milk as sent (and remember the calving date), or calculated from the calving date."""
+    if request.days_in_milk is not None:
+        cow.calving_date = (timestamp - timedelta(days=request.days_in_milk)).date()  # remember for next time
+        return request.days_in_milk
+    days = cow.days_in_milk(timestamp)
+    if days is None or days < 0:
+        raise InvalidReadingError("days_in_milk", f"required: cow {request.cow_id} has no calving date on record")
+    return days
 
 
-def reading_to_row(r: Reading, cow: Cow) -> dict:
+def reading_to_row(reading: Reading, cow: Cow) -> dict:
     """DB reading -> one row with the training-CSV column names used by ml/features.py."""
-    return {"cow_id": cow.tag, "timestamp": r.timestamp, "breed": cow.breed, "parity": cow.parity,
-            "days_in_milk": r.days_in_milk, "grazing_system": cow.grazing_system,
-            "ec_ms_cm": r.ec_ms_cm, "ph": r.ph, "milk_temp_c": r.milk_temp_c, "milk_yield_l": r.milk_yield_l,
-            "baseline_exclude": bool(r.baseline_exclude),
-            **{f"ec_{q.lower()}": getattr(r, f"ec_{q}") for q in QUARTERS}}
+    return {
+        "cow_id": cow.tag,
+        "timestamp": reading.timestamp,
+        "breed": cow.breed,
+        "parity": cow.parity,
+        "days_in_milk": reading.days_in_milk,
+        "grazing_system": cow.grazing_system,
+        "ec_ms_cm": reading.ec_ms_cm,
+        "ph": reading.ph,
+        "milk_temp_c": reading.milk_temp_c,
+        "milk_yield_l": reading.milk_yield_l,
+        "baseline_exclude": bool(reading.baseline_exclude),
+        **{f"ec_{key.lower()}": getattr(reading, f"ec_{key}") for key in QUARTER_KEYS},
+    }
 
 
-def is_alert(level: str, ts: datetime, previous: Reading | None) -> bool:
-    """Contract rule: this AND the cow's previous reading are both 'high', at most 48 h apart."""
-    return (level == "high" and previous is not None and previous.risk_level == "high"
-            and ts - previous.timestamp <= ALERT_MAX_GAP)
+def new_reading_row(cow: Cow, request: PredictRequest, timestamp: datetime, days_in_milk: int) -> dict:
+    """The incoming reading as a row with the training-CSV column names."""
+    quarters = request.ec_quarters.model_dump() if request.ec_quarters else {}
+    return {
+        "cow_id": cow.tag,
+        "timestamp": timestamp,
+        "breed": cow.breed,
+        "parity": cow.parity,
+        "days_in_milk": days_in_milk,
+        "grazing_system": cow.grazing_system,
+        "ec_ms_cm": request.ec_ms_cm,
+        "baseline_exclude": False,  # its own flag never affects its own features
+        "ph": request.ph,
+        "milk_temp_c": request.milk_temp_c,
+        "milk_yield_l": request.milk_yield_l,
+        **{f"ec_{key.lower()}": quarters.get(key) for key in QUARTER_KEYS},
+    }
 
 
-def active_alert(session: Session, cow_id: int) -> Alert | None:
-    q = (select(Alert).where(Alert.cow_id == cow_id, Alert.status.in_(ACTIVE_ALERT_STATUSES))
-         .order_by(Alert.id.desc()))
-    return session.execute(q.limit(1)).scalar_one_or_none()
+def load_history(session: Session, cow: Cow, timestamp: datetime) -> list[Reading]:
+    """The cow's readings from the last HISTORY_DAYS days, strictly before this milking."""
+    return (
+        session.execute(
+            select(Reading)
+            .where(
+                Reading.cow_id == cow.id,
+                Reading.timestamp >= timestamp - timedelta(days=HISTORY_DAYS),
+                Reading.timestamp < timestamp,
+            )
+            .order_by(Reading.timestamp)
+        )
+        .scalars()
+        .all()
+    )
 
 
-def latest_reading(session: Session, cow_id: int) -> Reading | None:
-    return session.execute(select(Reading).where(Reading.cow_id == cow_id)
-                           .order_by(Reading.timestamp.desc()).limit(1)).scalar_one_or_none()
+def model_frame(history: list[Reading], cow: Cow, new_row: dict) -> pd.DataFrame:
+    """History + new reading as one frame for ml/features.py (missing values as NaN)."""
+    frame = pd.DataFrame([reading_to_row(reading, cow) for reading in history] + [new_row])
+    numeric = [col for col in frame.columns if col not in TEXT_COLUMNS]
+    frame[numeric] = frame[numeric].astype(float)  # None -> NaN
+    return frame
 
 
-def close_alert(session: Session, alert: Alert, status: str, note: str | None = None,
-                when: datetime | None = None):
-    """Farmer closes an episode (treated / false_alarm) or acknowledges it (checked).
-    Used by the dashboard, USSD and the seed script."""
-    alert.status = status
-    if note:
-        alert.note = note
-    if status in CLOSING_STATUSES:
-        alert.closed_at = when or datetime.now().replace(microsecond=0)
-        last = latest_reading(session, alert.cow_id)
-        alert.closed_after_reading_id = last.id if last else None
-    else:
-        alert.closed_at = None
+def save_reading(
+    session: Session, cow: Cow, request: PredictRequest, timestamp: datetime, days_in_milk: int, result: dict
+) -> Reading:
+    """Insert the reading, or update it if this cow + timestamp was already sent."""
+    reading = session.execute(
+        select(Reading).where(Reading.cow_id == cow.id, Reading.timestamp == timestamp)
+    ).scalar_one_or_none()
+    if reading is None:
+        reading = Reading(cow=cow, timestamp=timestamp)
+        session.add(reading)
+    quarters = request.ec_quarters.model_dump() if request.ec_quarters else {}
+    reading.ec_ms_cm, reading.ph = request.ec_ms_cm, request.ph
+    reading.milk_temp_c, reading.milk_yield_l = request.milk_temp_c, request.milk_yield_l
+    reading.days_in_milk = days_in_milk
+    for key in QUARTER_KEYS:
+        setattr(reading, f"ec_{key}", quarters.get(key))
+    if request.cmt_score is not None:  # never wipe a label entered via /cmt
+        reading.cmt_score = request.cmt_score
+    reading.risk_score, reading.risk_level, reading.alert = result["score"], result["level"], result["alert"]
+    reading.top_reasons, reading.model_version = result["reasons"], result["version"]
+    session.flush()  # reading.id
+    return reading
 
 
-def rearmed(session: Session, cow_id: int) -> bool:
-    """False while the cow's last farmer-closed episode has not been followed by a non-high
-    reading: the cow is still recovering from that episode, so it must not open a new one."""
-    closed = session.execute(
-        select(Alert).where(Alert.cow_id == cow_id, Alert.status.in_(CLOSING_STATUSES),
-                            Alert.closed_after_reading_id.is_not(None))
-        .order_by(Alert.id.desc()).limit(1)).scalar_one_or_none()
-    if closed is None:
-        return True
-    since = session.get(Reading, closed.closed_after_reading_id).timestamp
-    normal_after = session.execute(
-        select(Reading.id).where(Reading.cow_id == cow_id, Reading.timestamp > since,
-                                 Reading.risk_level != "high").limit(1)).first()
-    return normal_after is not None
-
-
-def update_episode(session: Session, cow: Cow, reading: Reading, quarter: str | None) -> Alert | None:
-    """Create / extend / auto-resolve the cow's alert episode. Returns a NEW alert, if one was made."""
-    current = active_alert(session, cow.id)
-    if reading.alert:
-        if current is None and not rearmed(session, cow.id):
-            return None                                        # still high after treatment: no new SMS
-        if current is None:                                    # new episode -> new row + SMS
-            new = Alert(cow=cow, reading_id=reading.id, last_reading_id=reading.id, reading_count=1,
-                        created_at=reading.timestamp, status="open")
-            session.add(new)
-            session.flush()                                    # get new.id for the SMS log
-            notify_new_alert(session, new, quarter, when=reading.timestamp)
-            return new
-        if current.last_reading_id != reading.id:              # ongoing episode -> attach
-            current.last_reading_id = reading.id
-            current.reading_count += 1
-        return None
-
-    # Not an alert reading: close the episode after 4 consecutive non-high readings
-    if current is not None and reading.risk_level != "high":
-        since = session.get(Reading, current.last_reading_id).timestamp
-        recent = session.execute(
-            select(Reading.risk_level).where(Reading.cow_id == cow.id, Reading.timestamp > since)
-            .order_by(Reading.timestamp.desc()).limit(AUTO_RESOLVE_AFTER)).scalars().all()
-        if len(recent) == AUTO_RESOLVE_AFTER and all(level != "high" for level in recent):
-            current.status = "resolved_auto"
-            current.closed_at = reading.timestamp
-            current.note = f"Auto-resolved after {AUTO_RESOLVE_AFTER} consecutive non-high readings"
-    return None
-
-
-# ------------------------------------------------------------------ main entry point
-def handle_reading(session: Session, req: PredictRequest) -> tuple[PredictResponse, Reading]:
+def _require_predictor() -> Predictor:
     predictor = get_predictor()
     if predictor is None:
-        raise ModelNotLoaded("Model not loaded - run `python -m ml.train` first")
-    ts = (req.timestamp or datetime.now()).replace(tzinfo=None, microsecond=0)
+        raise ModelNotLoadedError("Model not loaded - run `python -m ml.train` first")
+    return predictor
 
-    # 1) Farm, cow, days in milk
-    cow = get_or_create_cow(session, req)
-    dim = resolve_days_in_milk(cow, req, ts)
-    session.flush()                                            # cow.id
 
-    # 2) History (strictly before this milking) + the new reading -> model
-    history = session.execute(
-        select(Reading).where(Reading.cow_id == cow.id, Reading.timestamp >= ts - timedelta(days=HISTORY_DAYS),
-                              Reading.timestamp < ts).order_by(Reading.timestamp)).scalars().all()
-    quarters = req.ec_quarters.model_dump() if req.ec_quarters else {}
-    new = {"cow_id": cow.tag, "timestamp": ts, "breed": cow.breed, "parity": cow.parity,
-           "days_in_milk": dim, "grazing_system": cow.grazing_system, "ec_ms_cm": req.ec_ms_cm,
-           "baseline_exclude": False,                         # its own flag never affects its features
-           "ph": req.ph, "milk_temp_c": req.milk_temp_c, "milk_yield_l": req.milk_yield_l,
-           **{f"ec_{q.lower()}": quarters.get(q) for q in QUARTERS}}
-    frame = pd.DataFrame([reading_to_row(r, cow) for r in history] + [new])
-    num = [c for c in frame.columns if c not in ("cow_id", "timestamp", "breed", "grazing_system",
-                                                 "baseline_exclude")]
-    frame[num] = frame[num].astype(float)                     # None -> NaN
-    score, level, shap_row, feats = predictor.score(frame)
+# --------------------------------------------------------------------------- main entry point
+def handle_reading(session: Session, request: PredictRequest) -> tuple[PredictResponse, Reading]:
+    """Score, explain, store and alert on one milking reading (see the module docstring)."""
+    predictor = _require_predictor()
+    timestamp = (request.timestamp or datetime.now()).replace(tzinfo=None, microsecond=0)
 
-    # 3) Per-reading alert + farmer-facing explanation
-    alert = is_alert(level, ts, history[-1] if history else None)
-    quarter = suspect_quarter(new)                            # 'lr' etc. or None
-    reasons = top_reasons(shap_row, predictor.bundle["features"], feats, quarter, level,
-                          has_history=bool(history))
+    cow = get_or_create_cow(session, request)
+    days_in_milk = resolve_days_in_milk(cow, request, timestamp)
+    session.flush()  # cow.id
 
-    # 4) Save (update if this cow + timestamp was already sent)
-    reading = session.execute(
-        select(Reading).where(Reading.cow_id == cow.id, Reading.timestamp == ts)).scalar_one_or_none()
-    if reading is None:
-        reading = Reading(cow=cow, timestamp=ts)
-        session.add(reading)
-    reading.ec_ms_cm, reading.ph = req.ec_ms_cm, req.ph
-    reading.milk_temp_c, reading.milk_yield_l, reading.days_in_milk = req.milk_temp_c, req.milk_yield_l, dim
-    for q in QUARTERS:
-        setattr(reading, f"ec_{q}", quarters.get(q))
-    if req.cmt_score is not None:                             # never wipe a label entered via /cmt
-        reading.cmt_score = req.cmt_score
-    reading.risk_score, reading.risk_level, reading.alert = score, level, alert
-    reading.top_reasons, reading.model_version = reasons, predictor.version
-    session.flush()                                           # reading.id
+    history = load_history(session, cow, timestamp)
+    new_row = new_reading_row(cow, request, timestamp, days_in_milk)
+    score, level, shap_row, feature_row = predictor.score(model_frame(history, cow, new_row))
 
-    # 5) Episodes + SMS
+    alert = is_alert(level, timestamp, history[-1] if history else None)
+    quarter = suspect_quarter(new_row)  # 'lr' etc. or None
+    reasons = top_reasons(shap_row, predictor.features, feature_row, quarter, level, has_history=bool(history))
+
+    result = {"score": score, "level": level, "alert": alert, "reasons": reasons, "version": predictor.version}
+    reading = save_reading(session, cow, request, timestamp, days_in_milk, result)
     update_episode(session, cow, reading, quarter.upper() if quarter else None)
     session.flush()
-
-    # 6) Clean-baseline flag (same rule as training: ml/episodes.py)
     reading.baseline_exclude = level == "high" or active_alert(session, cow.id) is not None
     session.commit()
 
     response = PredictResponse(
-        cow_id=req.cow_id, risk_score=round(score, 2), risk_level=level, top_reasons=reasons,
+        cow_id=request.cow_id,
+        risk_score=round(score, 2),
+        risk_level=level,
+        top_reasons=reasons,
         advice=advice(level, quarter if level != "low" else None),
-        model_version=predictor.version, alert=alert)
+        model_version=predictor.version,
+        alert=alert,
+    )
     return response, reading
+
+
+# --------------------------------------------------------------------------- read-only API data
+def reading_json(reading: Reading, cow: Cow) -> dict:
+    """A stored reading as returned by GET /history/{cow_id}."""
+    return {
+        "cow_id": cow.tag,
+        "timestamp": reading.timestamp.isoformat(),
+        "ec_ms_cm": reading.ec_ms_cm,
+        "ec_quarters": {key: getattr(reading, f"ec_{key}") for key in QUARTER_KEYS},
+        "milk_temp_c": reading.milk_temp_c,
+        "ph": reading.ph,
+        "milk_yield_l": reading.milk_yield_l,
+        "days_in_milk": reading.days_in_milk,
+        "cmt_score": reading.cmt_score,
+        "risk_score": reading.risk_score,
+        "risk_level": reading.risk_level,
+        "alert": reading.alert,
+        "top_reasons": reading.top_reasons,
+        "model_version": reading.model_version,
+    }
+
+
+def cow_history(session: Session, cow_tag: str, limit: int) -> list[dict]:
+    """Stored readings for a cow tag, newest first ([] for an unknown cow)."""
+    cow = session.execute(select(Cow).where(Cow.tag == cow_tag)).scalar_one_or_none()
+    if cow is None:
+        return []
+    readings = (
+        session.execute(select(Reading).where(Reading.cow_id == cow.id).order_by(Reading.timestamp.desc()).limit(limit))
+        .scalars()
+        .all()
+    )
+    return [reading_json(reading, cow) for reading in readings]
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def model_info() -> dict:
+    """Model name, version, threshold, risk bands, alert rule and metrics (GET /model-info)."""
+    bundle = _require_predictor().bundle
+    metrics = _read_json(METRICS_PATH)
+    metadata = _read_json(METADATA_PATH)
+    return {
+        "model_name": bundle["model_name"],
+        "version": bundle["version"],
+        "trained_at": bundle["trained_at"],
+        "threshold": bundle["threshold"],
+        "risk_bands": risk_bands(bundle["threshold"]),
+        "alert_rule": f"alert=true when this and the previous reading of the cow are both 'high' "
+        f"(at most {int(ALERT_MAX_GAP.total_seconds() // SECONDS_PER_HOUR)} h apart)",
+        "features": bundle["features"],
+        "positive_definition": bundle["positive_definition"],
+        "data": bundle["data"],
+        "test_metrics": metrics.get("test_metrics"),
+        "cv_results": metadata.get("cv_results"),
+    }
+
+
+def health() -> dict:
+    """Liveness + whether a model is loaded (GET /health)."""
+    predictor = get_predictor()
+    return {
+        "status": "ok",
+        "model_loaded": predictor is not None,
+        "model_version": predictor.version if predictor else None,
+    }

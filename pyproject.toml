@@ -1,0 +1,46 @@
+[project]
+name = "mastitis-ai"
+version = "1.2.0"
+description = "Early warning for subclinical mastitis in dairy cows (university prototype, SIMULATED data)"
+requires-python = ">=3.10"
+
+# ----------------------------------------------------------------------------- ruff (lint + format)
+# Run:  ruff check .   and   ruff format .
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["venv"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes (unused imports / variables, undefined names)
+    "I",        # import sorting
+    "N",        # pep8 naming
+    "B",        # bugbear (likely bugs)
+    "UP",       # modern Python syntax
+    "SIM",      # simplifications
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific checks
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI declares request parameters with these calls as defaults - that is the intended pattern.
+extend-immutable-calls = ["fastapi.Form", "fastapi.Query", "fastapi.Depends"]
+
+[tool.ruff.lint.pep8-naming]
+# ML convention: X (features) / y (labels) in dictionary keys and test data are allowed.
+ignore-names = ["X_*", "y_*"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use the ML convention X for a feature matrix.
+"tests/*" = ["N806"]
+# Form field names (sessionId, serviceCode, phoneNumber) are fixed by Africa's Talking.
+"api/routes/ussd.py" = ["N803"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ----------------------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]

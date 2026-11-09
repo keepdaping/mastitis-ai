@@ -6,31 +6,31 @@
   farms. These numbers show the method works, not how it will perform on real Ugandan farms.
   Real sensor and CMT data are needed to validate it.</div>
 
-{% if p %}
+{% if predictor %}
 <div class="row g-3 mb-3">
   <div class="col-md-6"><div class="card h-100"><div class="card-body">
     <h2 class="h5">Current model</h2>
     <dl class="row mb-0">
-      <dt class="col-5">Version</dt><dd class="col-7 mono">{{ p.version }}</dd>
-      <dt class="col-5">Algorithm</dt><dd class="col-7">{{ p.bundle.model_name }}</dd>
-      <dt class="col-5">Trained</dt><dd class="col-7 mono">{{ p.bundle.trained_at }}</dd>
-      <dt class="col-5">Positive =</dt><dd class="col-7">{{ p.bundle.positive_definition }}</dd>
-      <dt class="col-5">Risk bands</dt><dd class="col-7 mono">low &lt; {{ floor }} &le; medium &lt; {{ "%.3f"|format(p.threshold) }} &le; high</dd>
+      <dt class="col-5">Version</dt><dd class="col-7 mono">{{ predictor.version }}</dd>
+      <dt class="col-5">Algorithm</dt><dd class="col-7">{{ predictor.bundle.model_name }}</dd>
+      <dt class="col-5">Trained</dt><dd class="col-7 mono">{{ predictor.bundle.trained_at }}</dd>
+      <dt class="col-5">Positive =</dt><dd class="col-7">{{ predictor.bundle.positive_definition }}</dd>
+      <dt class="col-5">Risk bands</dt><dd class="col-7 mono">low &lt; {{ floor }} &le; medium &lt; {{ "%.3f"|format(predictor.threshold) }} &le; high</dd>
       <dt class="col-5">SMS alert</dt><dd class="col-7">2 high readings in a row, max 1 SMS per episode</dd>
     </dl>
   </div></div></div>
-  {% set t = metrics.get("test_metrics", {}) %}
+  {% set test = metrics.get("test_metrics", {}) %}
   <div class="col-md-6"><div class="card h-100"><div class="card-body">
     <h2 class="h5">On held-out farms {{ metrics.get("test_farms", [])|join(", ") }}</h2>
-    {% if t %}
+    {% if test %}
     <div class="row text-center g-2">
       {% for key, label in [("recall", "Sick cows caught"), ("precision", "Alerts that were right"),
                             ("specificity", "Healthy cows not flagged"), ("roc_auc", "ROC-AUC")] %}
-      <div class="col-6"><div class="border rounded p-2"><div class="fs-3 fw-bold mono">{{ "%.0f"|format(t[key]*100) if key != "roc_auc" else "%.2f"|format(t[key]) }}{{ "%" if key != "roc_auc" }}</div>
+      <div class="col-6"><div class="border rounded p-2"><div class="fs-3 fw-bold mono">{{ "%.0f"|format(test[key]*100) if key != "roc_auc" else "%.2f"|format(test[key]) }}{{ "%" if key != "roc_auc" }}</div>
         <div class="small text-secondary">{{ label }} ({{ key }})</div></div></div>
       {% endfor %}
     </div>
-    <p class="small text-secondary mt-2 mb-0">Per CMT-labelled milking: {{ t.tp }} true alarms, {{ t.fn }} missed, {{ t.fp }} false alarms, {{ t.tn }} correct all-clears.</p>
+    <p class="small text-secondary mt-2 mb-0">Per CMT-labelled milking: {{ test.tp }} true alarms, {{ test.fn }} missed, {{ test.fp }} false alarms, {{ test.tn }} correct all-clears.</p>
     {% else %}<p class="text-secondary">Run <code>python -m ml.evaluate</code> to create the metrics.</p>{% endif %}
   </div></div></div>
 </div>
